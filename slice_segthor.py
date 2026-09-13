@@ -37,7 +37,7 @@ from skimage.io import imsave
 from skimage.transform import resize
 
 from utils import map_, tqdm_
-
+import nibabel.processing as nibproc
 
 def norm_arr(img: np.ndarray) -> np.ndarray:
     casted = img.astype(np.float32)
@@ -81,7 +81,7 @@ resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_a
 
 
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
-                  test_mode: bool = False) -> tuple[float, float, float]:
+                  test_mode: bool = False, clip: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> tuple[float, float, float]:
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -93,6 +93,11 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     assert sanity_ct(ct, *ct.shape, *nib_obj.header.get_zooms())
 
+    # Clip HU ranges before normalization
+    if clip:
+        ct = np.clip(ct, -1000, 1000)
+        nib_obj = nib.Nifti1Image(ct, affine=nib_obj.affine, header=nib_obj.header)
+
     gt: np.ndarray
     if not test_mode:
         gt_path: Path = id_path / "GT.nii.gz"
@@ -100,8 +105,26 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         # print(nib_obj.affine, gt_nib.affine)
         gt = np.asarray(gt_nib.dataobj)
         assert sanity_gt(gt, ct)
+        gt_nib = nib.Nifti1Image(gt, affine=gt_nib.affine, header=gt_nib.header)
     else:
-        gt = np.zeros_like(ct, dtype=np.uint8)
+        gt_nib = nib.Nifti1Image(np.zeros_like(ct, dtype=np.uint8), affine=nib_obj.affine)
+
+    # Already uses canonical
+    ct_resampled_nib = nibproc.resample_to_output(nib_obj, voxel_sizes=new_spacing, order=3, mode='nearest')
+    gt_resampled_nib = nibproc.resample_to_output(gt_nib, voxel_sizes=new_spacing, order=0, mode='nearest')
+
+    ct = np.asarray(ct_resampled_nib.dataobj)
+    gt = np.asarray(gt_resampled_nib.dataobj).astype(np.uint8)
+
+    # Flipped images for the b-spline
+    ct = np.flip(ct, axis=(0, 1))
+    gt = np.flip(gt, axis=(0, 1))
+
+    # recompute
+    x, y, z = ct.shape 
+
+    # spacing is now new_spacing, for spacing.pkl record
+    dx, dy, dz = ct_resampled_nib.header.get_zooms()  
 
     norm_ct: np.ndarray = norm_arr(ct)
 
@@ -180,7 +203,9 @@ def main(args: argparse.Namespace):
                                  dest_path=dest_mode,
                                  source_path=src_path,
                                  shape=tuple(args.shape),
-                                 test_mode=mode == 'test')
+                                 test_mode=mode == 'test',
+                                 clip=args.clip,
+                                 new_spacing=tuple(args.new_spacing))
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -210,6 +235,9 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--fold', type=int, default=0)
     parser.add_argument('--process', '-p', type=int, default=1,
                         help="The number of cores to use for processing")
+    parser.add_argument('--clip', action='store_true',
+                     help="Clip CT Hounsfield Unit values to [-1000, 1000] before normalizing.")
+    parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0])
     args = parser.parse_args()
     random.seed(args.seed)
 
