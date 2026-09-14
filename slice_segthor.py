@@ -23,6 +23,7 @@
 # SOFTWARE.
 
 import pickle
+import json
 import random
 import argparse
 import warnings
@@ -80,8 +81,58 @@ def sanity_gt(gt, ct) -> bool:
 resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_aliasing=False)
 
 
+def _check_annotation_geometry(reference, annotation, path: Path) -> None:
+    if reference.shape != annotation.shape:
+        raise ValueError(f"Annotation shape does not match the CT: {path}")
+    if not np.allclose(reference.affine, annotation.affine, rtol=0, atol=1e-5):
+        raise ValueError(f"Annotation affine does not match the CT: {path}")
+    if not np.allclose(reference.header.get_zooms(), annotation.header.get_zooms(),
+                       rtol=0, atol=1e-5):
+        raise ValueError(f"Annotation spacing does not match the CT: {path}")
+
+
+def select_annotation(id_path: Path, ct_nib, gt_nib):
+    gt_path = id_path / "GT.nii.gz"
+    _check_annotation_geometry(ct_nib, gt_nib, gt_path)
+    gt = np.asarray(gt_nib.dataobj)
+    if not set(np.unique(gt)) <= {0, 1, 2, 3}:
+        raise ValueError(f"Expected merged labels 0, 1, 2, 3 in {gt_path}")
+    if id_path.name != "Patient_07":
+        return gt_nib
+
+    fine_path = id_path / "GT2.nii.gz"
+    if not fine_path.is_file():
+        raise FileNotFoundError(f"Patient 7 fine supervision requires {fine_path}")
+    fine_nib = nib.load(str(fine_path))
+    _check_annotation_geometry(ct_nib, fine_nib, fine_path)
+    fine = np.asarray(fine_nib.dataobj)
+    fine_labels = set(np.unique(fine))
+    if not fine_labels <= {0, 1, 2, 3, 4} or not {1, 4} <= fine_labels:
+        raise ValueError(f"GT2 must contain esophagus (1) and aorta (4), with labels 0–4: {fine_path}")
+    merged = fine.copy()
+    merged[merged == 4] = 1
+    if not np.array_equal(merged, gt):
+        raise ValueError(f"GT2 with aorta 4 mapped to 1 must exactly reproduce {gt_path}")
+    return fine_nib
+
+
+def annotation_manifest(training_ids: list[str], validation_ids: list[str]) -> dict:
+    if "Patient_07" not in training_ids or "Patient_07" in validation_ids:
+        raise ValueError("--use-gt2-patient7 requires Patient_07 in the training split")
+    patients = {}
+    for split, patient_ids in (("train", training_ids), ("val", validation_ids)):
+        for patient_id in patient_ids:
+            fine = patient_id == "Patient_07"
+            patients[patient_id] = {
+                "split": split,
+                "annotation": "fine" if fine else "merged",
+                "source": "GT2.nii.gz" if fine else "GT.nii.gz",
+            }
+    return {"version": 1, "label_schema": "segthor_merged_1_4", "patients": patients}
+
+
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
-                  test_mode: bool = False, clip: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> tuple[float, float, float]:
+                  test_mode: bool = False, clip: bool = False, z_score: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0), use_gt2_patient7: bool = False) -> tuple[float, float, float]:
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -93,7 +144,7 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     assert sanity_ct(ct, *ct.shape, *nib_obj.header.get_zooms())
 
-    # Clip HU ranges before normalization
+    # Clip HU ranges before normalization 
     if clip:
         ct = np.clip(ct, -1000, 1000)
         nib_obj = nib.Nifti1Image(ct, affine=nib_obj.affine, header=nib_obj.header)
@@ -103,6 +154,8 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         gt_path: Path = id_path / "GT.nii.gz"
         gt_nib = nib.load(str(gt_path))
         # print(nib_obj.affine, gt_nib.affine)
+        if use_gt2_patient7:
+            gt_nib = select_annotation(id_path, nib_obj, gt_nib)
         gt = np.asarray(gt_nib.dataobj)
         assert sanity_gt(gt, ct)
         gt_nib = nib.Nifti1Image(gt, affine=gt_nib.affine, header=gt_nib.header)
@@ -192,6 +245,14 @@ def main(args: argparse.Namespace):
     test_ids: list[str]
     training_ids, validation_ids, test_ids = get_splits(src_path, args.retains, args.fold)
 
+    use_gt2_patient7 = getattr(args, "use_gt2_patient7", False)
+    manifest = None
+    if use_gt2_patient7:
+        manifest = annotation_manifest(training_ids, validation_ids)
+        fine_path = src_path / "train" / "Patient_07" / "GT2.nii.gz"
+        if not fine_path.is_file():
+            raise FileNotFoundError(f"Patient 7 fine supervision requires {fine_path}")
+
     resolution_dict: dict[str, tuple[float, float, float]] = {}
 
     split_ids: list[str]
@@ -205,7 +266,8 @@ def main(args: argparse.Namespace):
                                  shape=tuple(args.shape),
                                  test_mode=mode == 'test',
                                  clip=args.clip,
-                                 new_spacing=tuple(args.new_spacing))
+                                 new_spacing=tuple(args.new_spacing),
+                                 use_gt2_patient7=use_gt2_patient7)
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -223,6 +285,11 @@ def main(args: argparse.Namespace):
         pickle.dump(resolution_dict, f, pickle.HIGHEST_PROTOCOL)
         print(f"Saved spacing dictionnary to {f}")
 
+    if manifest is not None:
+        with open(dest_path / "annotations.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+            f.write("\n")
+
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Slicing parameters')
@@ -238,6 +305,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--clip', action='store_true',
                      help="Clip CT Hounsfield Unit values to [-1000, 1000] before normalizing.")
     parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0])
+    parser.add_argument('--use-gt2-patient7', action='store_true',
+                        help="Use validated GT2 for training Patient_07 and record fine/merged annotations")
     args = parser.parse_args()
     random.seed(args.seed)
 
