@@ -61,8 +61,19 @@ datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, '
 # Added
 datasets_params["SEGTHOR_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_zscore_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_zscore_patient_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 def img_transform(img):
+        if isinstance(img, np.ndarray):
+            return torch.as_tensor(img[np.newaxis, ...], dtype=torch.float32) # for images produced by z-scoring
         img = img.convert('L')
         img = np.array(img)[np.newaxis, ...]
         img = img / 255  # max <= 1
@@ -177,7 +188,7 @@ def runTraining(args):
                         opt.zero_grad()
 
                     # Sanity tests to see we loaded and encoded the data correctly
-                    assert 0 <= img.min() and img.max() <= 1
+                    assert torch.isfinite(img).all(), "Input contains non-finite intensities" # images produced by z-scoring are no longer 0 to 1
                     B, _, W, H = img.shape
 
                     pred_logits = net(img)
