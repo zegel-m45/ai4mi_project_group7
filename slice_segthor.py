@@ -39,6 +39,68 @@ from skimage.transform import resize
 from utils import map_, tqdm_
 import nibabel.processing as nibproc
 
+
+def compute_train_data_HU_stats(source_path: Path, ids: list[str], clip: bool = False) -> dict[str, float]:
+    """
+    Compute the mean, std, min, and max of the Hounsfield Unit values across the training data.
+    This function iterates over the provided list of patient IDs, loads their corresponding CT scans, optionally clips
+    the HU values to a specified range, and computes the statistics.
+    """
+    min_value = float('inf')
+    max_value = float('-inf')
+    total_voxels = 0.0
+    sum_value = 0.0
+    sum_squared_value = 0.0
+
+    for id_ in tqdm_(ids):
+        ct_path: Path = source_path / "train" / id_ / f"{id_}.nii.gz"
+        nib_obj = nib.load(str(ct_path))
+        ct: np.ndarray = np.asarray(nib_obj.dataobj)
+
+        assert sanity_ct(ct, *ct.shape, *nib_obj.header.get_zooms())
+
+        if clip:
+            ct = np.clip(ct, -1000, 1000)
+
+        min_value = min(min_value, ct.min())
+        max_value = max(max_value, ct.max())
+        total_voxels += ct.size
+        sum_value += ct.sum()
+        sum_squared_value += np.square(ct.astype(np.float64)).sum()
+
+    mean_value = sum_value / total_voxels
+    std_value = np.sqrt(max(0.0, (sum_squared_value / total_voxels) - mean_value ** 2))
+
+    print(f"Train dataset stats\n min={min_value:.1f} max={max_value:.1f} "
+          f"mean={mean_value:.2f} std={std_value:.2f} HU "
+          f"({total_voxels} voxels across {len(ids)} patients)")
+
+    return {"min": float(min_value), "max": float(max_value),
+            "mean": float(mean_value), "std": std_value}
+
+
+def zscore_arr_fixed(img: np.ndarray, mean: float, std: float) -> np.ndarray:
+    """
+    Normalize using z-score with fixed mean and standard deviation values.
+    """
+    casted = img.astype(np.float32)
+    shifted = casted - mean
+    norm = shifted / std
+    return norm.astype(np.float32)
+
+
+def norm_arr_fixed(img: np.ndarray, min_value: float, max_value: float) -> np.ndarray:
+    """
+    Normalize using min-max with fixed min and max values.
+    """
+    casted = img.astype(np.float32)
+    shifted = casted - min_value
+    norm = np.clip(shifted / (max_value - min_value), 0, 1)
+    res = 255 * norm
+
+    return res.astype(np.uint8)
+
+
 def norm_arr(img: np.ndarray) -> np.ndarray:
     casted = img.astype(np.float32)
     shifted = casted - casted.min()
@@ -81,7 +143,9 @@ resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_a
 
 
 def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int],
-                  test_mode: bool = False, clip: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> tuple[float, float, float]:
+                  test_mode: bool = False, clip: bool = False, norm="minmax", norm_scope="train_dataset", train_dataset_stats: dict | None = None,
+                  bspline: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> tuple[float, float, float]:
+
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -93,7 +157,7 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     assert sanity_ct(ct, *ct.shape, *nib_obj.header.get_zooms())
 
-    # Clip HU ranges before normalization
+    # CLIPPING HU ranges before normalization
     if clip:
         ct = np.clip(ct, -1000, 1000)
         nib_obj = nib.Nifti1Image(ct, affine=nib_obj.affine, header=nib_obj.header)
@@ -108,32 +172,58 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         gt_nib = nib.Nifti1Image(gt, affine=gt_nib.affine, header=gt_nib.header)
     else:
         gt_nib = nib.Nifti1Image(np.zeros_like(ct, dtype=np.uint8), affine=nib_obj.affine)
+        gt = np.asarray(gt_nib.dataobj)
 
-    # Already uses canonical
-    ct_resampled_nib = nibproc.resample_to_output(nib_obj, voxel_sizes=new_spacing, order=3, mode='nearest')
-    gt_resampled_nib = nibproc.resample_to_output(gt_nib, voxel_sizes=new_spacing, order=0, mode='nearest')
+    # RESAMPLING USING B-SPLINE INTERPOLATION
+    if bspline:
+        # Already uses canonical
+        ct_resampled_nib = nibproc.resample_to_output(nib_obj, voxel_sizes=new_spacing, order=3, mode='nearest')
+        gt_resampled_nib = nibproc.resample_from_to(gt_nib, ct_resampled_nib, order=0, mode='nearest')
 
-    ct = np.asarray(ct_resampled_nib.dataobj)
-    gt = np.asarray(gt_resampled_nib.dataobj).astype(np.uint8)
+        ct = np.asarray(ct_resampled_nib.dataobj)
+        gt = np.asarray(gt_resampled_nib.dataobj).astype(np.uint8)
 
-    # Flipped images for the b-spline
-    ct = np.flip(ct, axis=(0, 1))
-    gt = np.flip(gt, axis=(0, 1))
+        # Flipped images across 2 axes for the b-spline 
+        ct = np.flip(ct, axis=(0, 1))
+        gt = np.flip(gt, axis=(0, 1))
 
-    # recompute
-    x, y, z = ct.shape 
+        # recompute
+        x, y, z = ct.shape
 
-    # spacing is now new_spacing, for spacing.pkl record
-    dx, dy, dz = ct_resampled_nib.header.get_zooms()  
+        # spacing is now new_spacing, for spacing.pkl record
+        dx, dy, dz = ct_resampled_nib.header.get_zooms()
 
-    norm_ct: np.ndarray = norm_arr(ct)
+    # NORMALIZATION
+    if norm_scope == "train_dataset":
+        assert train_dataset_stats is not None, "train_dataset_stats must be provided for 'train_dataset' normalization scope"
+        if norm == "minmax":
+            min_value = train_dataset_stats["min"]
+            max_value = train_dataset_stats["max"]
+            norm_ct: np.ndarray = norm_arr_fixed(ct, min_value, max_value)
+        elif norm == "zscore":
+            mean = train_dataset_stats["mean"]
+            std = train_dataset_stats["std"]
+            norm_ct: np.ndarray = zscore_arr_fixed(ct, mean, std)
+        else:
+            raise ValueError(f"Invalid normalization method: {norm}. Must be 'minmax' or 'zscore'.")
+
+    elif norm_scope == "patient":
+        if norm == "minmax":
+            norm_ct: np.ndarray = norm_arr(ct)
+        elif norm == "zscore":
+            norm_ct: np.ndarray = zscore_arr_fixed(ct, ct.mean(), ct.std())
+        else:
+            raise ValueError(f"Invalid normalization method: {norm}. Must be 'minmax' or 'zscore'.")
+
+    else:
+        raise ValueError(f"Invalid norm_scope: {norm_scope}. Must be 'train_dataset' or 'patient'.")
 
     to_slice_ct = norm_ct
     to_slice_gt = gt
 
     for idz in range(z):
-        img_slice = resize_(to_slice_ct[:, :, idz], shape).astype(np.uint8)
-        gt_slice = resize_(to_slice_gt[:, :, idz], shape, order=0).astype(np.uint8)
+        img_slice = resize_(to_slice_ct[:, :, idz].T, shape).astype(np.float32 if norm == "zscore" else np.uint8) # transpose to match 3D slicer and online images orientation
+        gt_slice = resize_(to_slice_gt[:, :, idz].T, shape, order=0).astype(np.uint8) # transpose to match 3D slicer and online images orientation
         assert img_slice.shape == gt_slice.shape
         gt_slice *= 63
         assert gt_slice.dtype == np.uint8, gt_slice.dtype
@@ -150,6 +240,10 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
             save_path: Path = Path(dest_path, save_subfolder)
             save_path.mkdir(parents=True, exist_ok=True)
+
+            if save_subfolder == "img" and norm == "zscore":
+                np.save((save_path / filename).with_suffix(".npy"), data) # images produced by z-scoring are saved as .npy files as they are no longer in the range [0, 255] due to the nature of the method
+                continue
 
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", category=UserWarning)
@@ -191,6 +285,11 @@ def main(args: argparse.Namespace):
     validation_ids: list[str]
     test_ids: list[str]
     training_ids, validation_ids, test_ids = get_splits(src_path, args.retains, args.fold)
+    
+    if args.norm_scope == "train_dataset":
+        datasets_stats: dict[str, float] = compute_train_data_HU_stats(src_path, training_ids, args.clip)
+    else:
+        datasets_stats = None
 
     resolution_dict: dict[str, tuple[float, float, float]] = {}
 
@@ -205,7 +304,12 @@ def main(args: argparse.Namespace):
                                  shape=tuple(args.shape),
                                  test_mode=mode == 'test',
                                  clip=args.clip,
+                                 norm=args.norm,
+                                 norm_scope=args.norm_scope,
+                                 train_dataset_stats=datasets_stats,
+                                 bspline=args.bspline,
                                  new_spacing=tuple(args.new_spacing))
+
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -237,7 +341,13 @@ def get_args() -> argparse.Namespace:
                         help="The number of cores to use for processing")
     parser.add_argument('--clip', action='store_true',
                      help="Clip CT Hounsfield Unit values to [-1000, 1000] before normalizing.")
+    parser.add_argument('--norm', type=str, default="minmax", choices=["minmax", "zscore"],
+                        help="Normalization method to apply to CT images.")
+    parser.add_argument('--norm_scope', type=str, default="train_dataset", choices=["train_dataset", "patient"],
+                        help="Scope of normalization: 'train_dataset' uses statistics from the training dataset, while 'patient' uses statistics from each individual patient.")
     parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0])
+    parser.add_argument('--bspline', action='store_true',
+                     help="Resample volumes to isotropic spacing using B-spline interpolation before slicing.")
     args = parser.parse_args()
     random.seed(args.seed)
 
