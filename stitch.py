@@ -66,14 +66,14 @@ def merge_patient(id_: str, dest_folder: str, images: list[Path],
                                      anti_aliasing=False,
                                      order=0)
 
-        res_arr[:, :, z] = resized[...]
+        res_arr[:, :, z] = resized[...].T # transpose to match 3D slicer and online images orientation
 
     assert set(np.unique(res_arr)) <= set(range(K))
     assert orig_shape == res_arr.shape, (orig_shape, res_arr.shape)
 
     # res_arr = res_arr.astype(np.int16)
     res_arr //= 63  # For segthor only
-    assert set(np.unique(res_arr)) == set(range(5)), np.uint8(res_arr)
+    assert set(np.unique(res_arr)) == set(range(5)), np.uint8(res_arr) # NOTE: change back to 4 when testing with the corrupted data
 
     new_nib = nib.nifti1.Nifti1Image(res_arr, affine=orig_nib.affine, header=orig_nib.header)
     nib.save(new_nib, (Path(dest_folder) / id_).with_suffix(".nii.gz"))
