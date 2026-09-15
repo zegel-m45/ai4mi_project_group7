@@ -27,6 +27,7 @@ from typing import Callable, Union
 
 from torch import Tensor
 from PIL import Image
+import numpy as np # added for npy images produced by z-scoring
 from torch.utils.data import Dataset
 
 
@@ -39,10 +40,10 @@ def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
     img_path = root / subset / 'img'
     full_path = root / subset / 'gt'
 
-    images: list[Path] = sorted(img_path.glob("*.png"))
+    images: list[Path] = sorted([*img_path.glob("*.png"), *img_path.glob("*.npy")]) # added npy images produced by z-scoring
     full_labels: list[Path | None]
     if subset != 'test':
-        full_labels = sorted(full_path.glob("*.png"))
+        full_labels = [full_path / f"{image.stem}.png" for image in images] # go through images produced by z-scoring as well
     else:
         full_labels = [None] * len(images)
 
@@ -72,7 +73,7 @@ class SliceDataset(Dataset):
     def __getitem__(self, index) -> dict[str, Union[Tensor, int, str]]:
         img_path, gt_path = self.files[index]
 
-        img: Tensor = self.img_transform(Image.open(img_path))
+        img: Tensor = self.img_transform(np.load(img_path, allow_pickle=False) if img_path.suffix == '.npy' else Image.open(img_path)) # added npy for images produced by z-scoring
 
         data_dict = {"images": img,
                      "stems": img_path.stem}
