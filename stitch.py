@@ -30,6 +30,8 @@ from typing import Match, Pattern
 
 import numpy as np
 import nibabel as nib
+import nibabel.processing as nibproc
+from nibabel.spaces import vox2out_vox
 from skimage.io import imread
 from skimage.transform import resize
 
@@ -41,14 +43,17 @@ def get_z(image: Path) -> int:
 
 
 def merge_patient(id_: str, dest_folder: str, images: list[Path],
-                  idxes: list[int], K: int, source_pattern: str) -> None:
+                  idxes: list[int], K: int, source_pattern: str, bspline: bool = False,
+                  new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> None:
     # print(source_pattern.format(id_=id_))
     orig_nib = nib.load(source_pattern.format(id_=id_))
     orig_shape = np.asarray(orig_nib.dataobj).shape
     # print(orig_nib.affine)
 
-    X, Y, Z = orig_shape
-    assert Z == len(idxes)
+    # Recreate the grid used by resample_to_output in slice_segthor.py
+    shape, affine = vox2out_vox((orig_shape, orig_nib.affine), new_spacing) if bspline else (orig_shape, orig_nib.affine)
+    X, Y, Z = shape
+    assert sorted(get_z(images[i]) for i in idxes) == list(range(Z)), "Missing, duplicate, or unexpected slices"
 
     res_arr: np.ndarray = np.zeros((X, Y, Z), dtype=np.int16)
 
@@ -59,8 +64,9 @@ def merge_patient(id_: str, dest_folder: str, images: list[Path],
         img_arr = imread(img)
         assert img_arr.dtype == np.uint8
         assert set(np.unique(img_arr)) <= set(range(K))
+        img_arr = img_arr // 63
 
-        resized: np.ndarray = resize(img_arr, (X, Y),
+        resized: np.ndarray = resize(img_arr, (Y, X),
                                      mode="constant",
                                      preserve_range=True,
                                      anti_aliasing=False,
@@ -69,11 +75,14 @@ def merge_patient(id_: str, dest_folder: str, images: list[Path],
         res_arr[:, :, z] = resized[...].T # transpose to match 3D slicer and online images orientation
 
     assert set(np.unique(res_arr)) <= set(range(K))
-    assert orig_shape == res_arr.shape, (orig_shape, res_arr.shape)
 
-    # res_arr = res_arr.astype(np.int16)
-    res_arr //= 63  # For segthor only
-    assert set(np.unique(res_arr)) == set(range(5)), np.uint8(res_arr) # NOTE: change back to 4 when testing with the corrupted data
+    if bspline:
+        res_arr = np.flip(res_arr, axis=(0, 1))
+
+        res_arr = np.asarray(nibproc.resample_from_to(
+            nib.Nifti1Image(res_arr, affine), orig_nib, order=0, mode='nearest').dataobj).astype(np.int16)
+    
+    assert orig_shape == res_arr.shape, (orig_shape, res_arr.shape)
 
     new_nib = nib.nifti1.Nifti1Image(res_arr, affine=orig_nib.affine, header=orig_nib.header)
     nib.save(new_nib, (Path(dest_folder) / id_).with_suffix(".nii.gz"))
@@ -105,7 +114,7 @@ def main(args) -> None:
     args.dest_folder.mkdir(parents=True, exist_ok=True)
 
     for p in tqdm_(unique_patients):
-        merge_patient(p, args.dest_folder, images, idx_map[p], args.num_classes, args.source_scan_pattern)
+        merge_patient(p, args.dest_folder, images, idx_map[p], args.num_classes, args.source_scan_pattern, args.bspline, tuple(args.new_spacing))
     # mmap_(lambda p: merge_patient(p, args.dest_folder, images, idx_map[p], K=args.num_classes), patients)
 
 
@@ -119,6 +128,10 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--grp_regex', type=str, required=True)
 
     parser.add_argument('--num_classes', type=int, default=4)
+    parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0],
+                        help="Voxel spacing used when slicing with --bspline.")
+    parser.add_argument('--bspline', action='store_true',
+                        help="When stitching data was sliced with B-spline-resampled data.")
 
     args = parser.parse_args()
 
