@@ -31,7 +31,7 @@ import numpy as np # added for npy images produced by z-scoring
 from torch.utils.data import Dataset
 
 
-def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
+def make_dataset(root, subset, exclude: set[str] | None = None) -> list[tuple[Path, Path | None]]:
     assert subset in ['train', 'val', 'test']
 
     root = Path(root)
@@ -47,12 +47,20 @@ def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
     else:
         full_labels = [None] * len(images)
 
+    # Added for patient slices we need to exclude
+    if exclude:
+        pairs = [(img, gt) for img, gt in zip(images, full_labels) if img.stem not in exclude]
+        removed = len(images) - len(pairs)
+        print(f"> Excluded {removed} mislabeled slice(s) from {subset}")
+        return pairs
+
     return list(zip(images, full_labels))
 
 
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
-                 gt_transform=None, augment=False, equalize=False, debug=False):
+                 gt_transform=None, augment=False, equalize=False, debug=False, 
+                 exclude: set[str] | None = None):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
@@ -61,7 +69,7 @@ class SliceDataset(Dataset):
 
         self.test_mode: bool = subset == 'test'
 
-        self.files = make_dataset(root_dir, subset)
+        self.files = make_dataset(root_dir, subset, exclude=exclude)
         if debug:
             self.files = self.files[:10]
 
