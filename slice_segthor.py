@@ -164,7 +164,12 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     gt: np.ndarray
     if not test_mode:
-        gt_path: Path = id_path / "GT.nii.gz"
+        # Differentiate between used groundtruths
+        if id_ == "Patient_07":
+            gt_filename = "GT2.nii.gz" 
+        else:
+             gt_filename = "GT_split.nii.gz"
+        gt_path: Path = id_path / gt_filename
         gt_nib = nib.load(str(gt_path))
         # print(nib_obj.affine, gt_nib.affine)
         gt = np.asarray(gt_nib.dataobj)
@@ -343,7 +348,7 @@ def get_args() -> argparse.Namespace:
                      help="Clip CT Hounsfield Unit values to [-1000, 1000] before normalizing.")
     parser.add_argument('--norm', type=str, default="minmax", choices=["minmax", "zscore"],
                         help="Normalization method to apply to CT images.")
-    parser.add_argument('--norm_scope', type=str, default="train_dataset", choices=["train_dataset", "patient"],
+    parser.add_argument('--norm_scope', type=str, default="patient", choices=["train_dataset", "patient"],
                         help="Scope of normalization: 'train_dataset' uses statistics from the training dataset, while 'patient' uses statistics from each individual patient.")
     parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0])
     parser.add_argument('--bspline', action='store_true',
