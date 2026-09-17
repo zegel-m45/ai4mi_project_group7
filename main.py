@@ -70,6 +70,7 @@ datasets_params["SEGTHOR_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kerne
 datasets_params["SEGTHOR_clip_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_clip_zscore_patient_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_clip_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 def img_transform(img):
         if isinstance(img, np.ndarray):
@@ -111,13 +112,43 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     B: int = datasets_params[args.dataset]['B']
     root_dir = Path("data") / args.dataset
 
+    BAD_SLICES = {
+        "Patient_03_0080",
+        "Patient_03_0081",
+        "Patient_03_0082",
+        "Patient_04_0050",
+        "Patient_04_0060",
+        "Patient_05_0127",
+        "Patient_05_0128",
+        "Patient_05_0129",
+        "Patient_05_0130",
+        "Patient_13_0042",
+        "Patient_14_0091",
+        "Patient_15_0058",
+        "Patient_15_0059",
+        "Patient_15_0090",
+        "Patient_15_0092",
+        "Patient_17_0095",
+        "Patient_18_0116",
+        "Patient_19_0062",
+        "Patient_19_0104",
+        "Patient_19_0105"
+    }
 
+    BAD_SLICES_BSPLINE = {
+        
+    }
+
+    if args.bspline_slices:
+        exclude_set = BAD_SLICES_BSPLINE 
+    else:
+        exclude_set = BAD_SLICES
 
     train_set = SliceDataset('train',
                              root_dir,
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
-                             debug=args.debug)
+                             debug=args.debug, exclude=exclude_set) #added
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
@@ -127,7 +158,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            root_dir,
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
-                           debug=args.debug)
+                           debug=args.debug, exclude=exclude_set) #added
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
@@ -259,7 +290,8 @@ def main():
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
-
+    parser.add_argument('--bspline_slices', action='store_true',
+                     help="Use the bad-slice list for B-spline-resampled datasets")
     args = parser.parse_args()
 
     pprint(args)
