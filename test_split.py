@@ -1,5 +1,6 @@
 import nibabel as nib
 import numpy as np
+import os
 from scipy import ndimage
 
 # Labels
@@ -12,7 +13,7 @@ MIN_BLOB_AREA = 20        # Minimal area to consider it a blob
 ESOPHAGUS_MAX_SIZE = 400  # Maximal size used for classification of esophagus
 
 PATIENT = "Patient_01"
-BASE_PATH = "/home/kim/Documents/GitHub/ai4mi_project_group7/data/segthor_part1/train"
+BASE_PATH = os.path.expandvars("$HOME/ai4mi_project_group7/data/segthor_part1/train")
 INPUT_PATH = f"{BASE_PATH}/{PATIENT}/GT.nii.gz"
 OUTPUT_PATH = f"{BASE_PATH}/{PATIENT}/GT_split.nii.gz"
 
@@ -355,8 +356,21 @@ def above_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus):
     else:
         print(">= 4 blobs not handled yet.")
 
+# Added to process multiple patients
+def process_patient(patient_id):
+    # For patient_05
+    global PATIENT
+    PATIENT = patient_id
+    BASE_PATH = os.path.expandvars("$HOME/ai4mi_project_group7/data/segthor_part1/train")
+    INPUT_PATH = f"{BASE_PATH}/{PATIENT}/GT.nii.gz"
+    OUTPUT_PATH = f"{BASE_PATH}/{PATIENT}/GT_split.nii.gz"
 
-if __name__ == "__main__":
+    print(f"Processing {PATIENT}")
+    
+    if not os.path.exists(INPUT_PATH):
+        print(f"Skipping {PATIENT}: File not found at {INPUT_PATH}")
+        return
+
     img = nib.load(INPUT_PATH)
     data = img.get_fdata().astype(np.int16)
     print("Shape CT scan:", data.shape) # Differs per patient
@@ -368,10 +382,10 @@ if __name__ == "__main__":
     esophagus = Organ("esophagus")
 
     for z in range(data.shape[2]):
-        phase = get_location_wrt_heart(z,heart_bbox)
+        phase = get_location_wrt_heart(z, heart_bbox)
         current_slice = data[:, :, z] == 1
         blobs = get_blobs_per_slice(current_slice)
-
+        
         print(f"\nSlice {z}: " f"{len(blobs)} blobs" f"phase={phase}")
 
         for i, blob in enumerate(blobs):
@@ -393,19 +407,25 @@ if __name__ == "__main__":
         if phase == "below_heart":
             below_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus)
         elif phase == "heart":
-            during_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus,)
+            during_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus)
         elif phase == "above_heart":
-            above_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus,)
+            above_heart_cases(blobs, output, z, aorta_1, aorta_2, esophagus)
         else:
             print("Other case happening..? Not implemented")
 
+
     output_img = nib.Nifti1Image(
-        output,
-        img.affine,
-        img.header
-    )
+        output, 
+        img.affine, 
+        img.header)
     nib.save(output_img, OUTPUT_PATH)
     print(f"Saved output to: {OUTPUT_PATH}")
+
+if __name__ == "__main__":
+    patient_list = [f"Patient_{i:02d}" for i in range(1, 21)]
+    for patient in patient_list:
+        process_patient(patient)
         
+    print("\nAll patients processed!")
 
 
