@@ -51,6 +51,7 @@ from utils import (Dcm,
                    save_images)
 
 from losses import (CrossEntropy)
+import random
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -59,18 +60,16 @@ datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'fac
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 # Added
-datasets_params["SEGTHOR_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_zscore_bspline_flipped"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_zscore_patient_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_clip_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_clip_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 def img_transform(img):
         if isinstance(img, np.ndarray):
@@ -136,13 +135,28 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     }
 
     BAD_SLICES_BSPLINE = {
-        
-    }
+        "Patient_03_0199", "Patient_03_0200", "Patient_03_0201", "Patient_03_0202", "Patient_03_0203", "Patient_03_0204", "Patient_03_0205", "Patient_03_0206", 
+        "Patient_04_0124", "Patient_04_0125", "Patient_04_0126", "Patient_04_0149", "Patient_04_0150", "Patient_04_0151",
+        "Patient_05_0254", "Patient_05_0255", "Patient_05_0256", "Patient_05_0257", "Patient_05_0258", "Patient_05_0259", "Patient_05_0260",
+        "Patient_13_0083", "Patient_13_0084", 
+        "Patient_14_0227", "Patient_14_0228", 
+        "Patient_15_0144", "Patient_15_0145", "Patient_15_0146", "Patient_15_0147", "Patient_15_0148", 
+        "Patient_15_0224", "Patient_15_0225", "Patient_15_0226", "Patient_15_0229", "Patient_15_0230", "Patient_15_0231", 
+        "Patient_17_0237", "Patient_17_0238", 
+        "Patient_18_0289", "Patient_18_0290", "Patient_18_0291", 
+        "Patient_19_0154", "Patient_19_0155", "Patient_19_0156", 
+        "Patient_19_0259", "Patient_19_0260", "Patient_19_0261", "Patient_19_0262",  "Patient_19_0263"
+        }
+
 
     if args.bspline_slices:
         exclude_set = BAD_SLICES_BSPLINE 
     else:
         exclude_set = BAD_SLICES
+
+    # Set seed to Dataloader
+    generator = torch.Generator()
+    generator.manual_seed(args.seed)
 
     train_set = SliceDataset('train',
                              root_dir,
@@ -152,7 +166,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
-                              shuffle=True)
+                              shuffle=True,
+                              generator=generator)
 
     val_set = SliceDataset('val',
                            root_dir,
@@ -162,7 +177,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
-                            shuffle=False)
+                            shuffle=False,
+                            generator=generator)
 
     args.dest.mkdir(parents=True, exist_ok=True)
 
@@ -292,10 +308,12 @@ def main():
                              "to test the logics around epochs and logging easily.")
     parser.add_argument('--bspline_slices', action='store_true',
                      help="Use the bad-slice list for B-spline-resampled datasets")
+    parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
     args = parser.parse_args()
 
     pprint(args)
-
+    # Set seed
+    set_seed(args.seed)
     runTraining(args)
 
 
