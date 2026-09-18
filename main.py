@@ -67,11 +67,16 @@ datasets_params["SEGTHOR_FINAL_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels':
 datasets_params["SEGTHOR_FINAL_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_clip_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
+# Source - https://stackoverflow.com/a/64584503 
+# Posted by yeachan park, modified by community. See post 'Timeline' for change history 
+# Retrieved 2026-09-18, License - CC BY-SA 4.0
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def img_transform(img):
         if isinstance(img, np.ndarray):
