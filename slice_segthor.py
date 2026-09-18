@@ -195,7 +195,7 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
         # recompute
         x, y, z = ct.shape
 
-        # spacing is now new_spacing, for spacing.pkl record
+        # Spacing of the resampled volume, before the final 2D resize
         dx, dy, dz = ct_resampled_nib.header.get_zooms()
 
     # NORMALIZATION
@@ -254,7 +254,8 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
                 warnings.filterwarnings("ignore", category=UserWarning)
                 imsave(str(save_path / filename), data)
 
-    return dx, dy, dz
+    # Saved slices are transposed then resized recording (row, column, z) in mm
+    return dy * y / shape[0], dx * x / shape[1], dz
 
 
 def get_splits(src_path: Path, retains: int, fold: int) -> tuple[list[str], list[str], list[str]]:
