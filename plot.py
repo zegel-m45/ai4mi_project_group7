@@ -31,6 +31,9 @@ import matplotlib.pyplot as plt
 
 def run(args: argparse.Namespace) -> None:
     metrics: np.ndarray = np.load(args.metric_file)
+    # Exclude both-empty masks, while retaining finite one-empty penalties
+    is_hd = args.metric_file.stem.startswith('hd')
+    average = np.nanmean if is_hd else np.mean
     match metrics.ndim:
         case 2:
             E, N = metrics.shape
@@ -44,15 +47,21 @@ def run(args: argparse.Namespace) -> None:
 
     epcs = np.arange(E)
 
-    for k in range(1, K):
-        y = metrics[:, :, k].mean(axis=1)
-        ax.plot(epcs, y, label=f"{k=}", linewidth=1.5)
-
-    if K > 2:
-        ax.plot(epcs, metrics.mean(axis=1).mean(axis=1), label="All classes", linewidth=3)
+    if metrics.ndim == 3:
+        for k in range(1, K):
+            y = average(metrics[:, :, k], axis=1)
+            ax.plot(epcs, y, label=f"{k=}", linewidth=1.5)
+        if K > 1:
+            ax.plot(epcs, average(metrics[:, :, 1:], axis=(1, 2)),
+                    label="Foreground mean", linewidth=3)  
+            if not is_hd:
+                ax.plot(epcs, average(metrics, axis=(1, 2)), label="All classes", linewidth=3)
+        else:
+            ax.plot(epcs, average(metrics[:, :, 0], axis=1), label="k=0", linewidth=3)
         ax.legend()
     else:
-        ax.plot(epcs, metrics.mean(axis=1), linewidth=3)
+        ax.plot(epcs, average(metrics, axis=1), linewidth=3)
+    ax.set_xlabel("Epoch")
 
     fig.tight_layout()
     if args.dest:
