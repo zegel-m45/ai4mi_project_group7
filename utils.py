@@ -28,11 +28,13 @@ from multiprocessing import Pool
 from contextlib import AbstractContextManager
 from typing import Callable, Iterable, List, Set, Tuple, TypeVar, cast
 
+import warnings
 import torch
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 from torch import Tensor, einsum
+from monai.metrics import compute_hausdorff_distance
 
 tqdm_ = partial(tqdm, dynamic_ncols=True,
                 leave=True,
@@ -176,3 +178,30 @@ def union(a: Tensor, b: Tensor) -> Tensor:
     assert sset(res, [0, 1])
 
     return res
+
+def monai_percentile_hausdorff_distance(pred: Tensor, label: Tensor, percentile: float = 95.0, spacing=None) -> Tensor:
+    assert pred.shape == label.shape
+    assert one_hot(pred)
+    assert one_hot(label)
+
+    spacings = np.broadcast_to(np.asarray(1.0 if spacing is None else spacing), (len(pred), pred.ndim - 2))
+
+    pred_present, label_present = pred[:, 1:].flatten(2).any(2), label[:, 1:].flatten(2).any(2) # exclude background class
+    result = torch.full(pred_present.shape, float('nan'), device=pred.device, dtype=torch.float32)
+    both_present = pred_present & label_present
+
+    if both_present.any():
+        pair_spacing = spacings[both_present.nonzero()[:, 0].cpu().numpy()].tolist()
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=r".*get_mask_edges:always_return_as_numpy.*", category=FutureWarning)
+            result[both_present] = compute_hausdorff_distance(
+                pred[:, 1:][both_present][:, None], label[:, 1:][both_present][:, None],  # here background is already not present
+                include_background=True, distance_metric="euclidean", percentile=percentile, 
+                directed=False, spacing=pair_spacing)[:, 0]
+
+    physical_size = np.asarray(pred.shape[2:]) * spacings # use image diagonal penalty for one-empty pairs
+    diagonal = torch.as_tensor(np.linalg.norm(physical_size, axis=-1), device=result.device, dtype=result.dtype)
+    result = torch.where(pred_present ^ label_present, diagonal.reshape(-1, 1), result)
+
+    return torch.cat((result.new_full((len(pred), 1), float('nan')), result), dim=1)
+ 
