@@ -23,6 +23,7 @@
 # SOFTWARE.
 
 import argparse
+import pickle
 import warnings
 from typing import Any
 from pathlib import Path
@@ -48,6 +49,7 @@ from utils import (Dcm,
                    probs2class,
                    tqdm_,
                    dice_coef,
+                   monai_percentile_hausdorff_distance,
                    save_images)
 
 from losses import (CrossEntropy)
@@ -188,6 +190,11 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
     net, optimizer, device, train_loader, val_loader, K = setup(args)
+    patient_spacing = None
+    if args.dataset != 'TOY2':
+        # spacing.pkl contains resized slice (row, column, through-plane) spacing
+        with open(Path('data') / args.dataset / 'spacing.pkl', 'rb') as f:
+            patient_spacing = pickle.load(f)
 
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
@@ -199,8 +206,10 @@ def runTraining(args):
     # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
+
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
+    log_hd_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
     best_dice: float = 0
 
@@ -244,6 +253,13 @@ def runTraining(args):
                     # Metrics computation, not used for training
                     pred_seg = probs2one_hot(pred_probs)
                     log_dice[e, j:j + B, :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
+                    
+                    if m == 'val':
+                        spacing = None if patient_spacing is None else [
+                            [float(s) for s in patient_spacing[stem.rsplit('_', 1)[0]][:2]]
+                            for stem in data['stems']]
+                        log_hd_val[e, j:j + B, :] = monai_percentile_hausdorff_distance(
+                            pred_seg, gt, percentile=args.hd_percentile, spacing=spacing).detach().cpu()
 
                     loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
@@ -268,6 +284,12 @@ def runTraining(args):
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
+                    if m == 'val':
+                        postfix_dict[f"HD{args.hd_percentile}"] = f"{log_hd_val[e, :j, 1:].nanmean():05.3f}"
+                        if K > 2:
+                            postfix_dict |= {f"HD{args.hd_percentile}-{k}": f"{log_hd_val[e, :j, k].nanmean():05.3f}"
+                                             for k in range(1, K)}
+                                 
                     tq_iter.set_postfix(postfix_dict)
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
@@ -275,10 +297,13 @@ def runTraining(args):
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
         np.save(args.dest / "dice_val.npy", log_dice_val)
+        np.save(args.dest / "hd_val.npy", log_hd_val)
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
         if current_dice > best_dice:
-            message = f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
+            current_hd = log_hd_val[e, :, 1:].nanmean().item()
+            message = (f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
+                       f" | Validation HD{args.hd_percentile}: {current_hd:.3f}")
             print(message)
             best_dice = current_dice
             with open(args.dest / "best_epoch.txt", 'w') as f:
@@ -308,6 +333,7 @@ def main():
                              "to test the logics around epochs and logging easily.")
     parser.add_argument('--bspline_slices', action='store_true',
                      help="Use the bad-slice list for B-spline-resampled datasets")
+    parser.add_argument('--hd_percentile', type=int, default=95, choices=[90, 95, 99, 100], help="Percentile for Hausdorff distance computation")
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
     args = parser.parse_args()
 
