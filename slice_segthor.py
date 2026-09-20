@@ -258,19 +258,29 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     return dy * y / shape[0], dx * x / shape[1], dz
 
 
-def get_splits(src_path: Path, retains: int, fold: int) -> tuple[list[str], list[str], list[str]]:
+def get_splits(src_path: Path, retains: int, fold: int, val_patients: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     ids: list[str] = sorted(map_(lambda p: p.name, (src_path / 'train').glob('*')))
     print(f"Founds {len(ids)} in the id list")
     print(ids[:10])
-    assert len(ids) > retains
 
-    random.shuffle(ids)  # Shuffle before to avoid any problem if the patients are sorted in any way
-    validation_slice = slice(fold * retains, (fold + 1) * retains)
-    validation_ids: list[str] = ids[validation_slice]
-    assert len(validation_ids) == retains
+    if val_patients is not None:
+        validation_ids: list[str] = sorted(val_patients)
+        missing = [p for p in validation_ids if p not in ids]
+        assert not missing, f"Requested validation patients not found in source: {missing}"
 
-    training_ids: list[str] = [e for e in ids if e not in validation_ids]
-    assert (len(training_ids) + len(validation_ids)) == len(ids)
+        training_ids: list[str] = [e for e in ids if e not in validation_ids]
+        assert (len(training_ids) + len(validation_ids)) == len(ids)
+    else:
+        print("You're running the old code")
+        # Old code
+        assert len(ids) > retains
+        random.shuffle(ids)  # Shuffle before to avoid any problem if the patients are sorted in any way
+        validation_slice = slice(fold * retains, (fold + 1) * retains)
+        validation_ids = ids[validation_slice]
+        assert len(validation_ids) == retains
+
+        training_ids: list[str] = [e for e in ids if e not in validation_ids]
+        assert (len(training_ids) + len(validation_ids)) == len(ids)
 
     test_ids: list[str] = sorted(map_(lambda p: Path(p.stem).stem, (src_path / 'test').glob('*')))
     print(f"Founds {len(test_ids)} test ids")
@@ -290,7 +300,7 @@ def main(args: argparse.Namespace):
     training_ids: list[str]
     validation_ids: list[str]
     test_ids: list[str]
-    training_ids, validation_ids, test_ids = get_splits(src_path, args.retains, args.fold)
+    training_ids, validation_ids, test_ids = get_splits(src_path, args.retains, args.fold, args.val_patients)
     
     if args.norm_scope == "train_dataset":
         datasets_stats: dict[str, float] = compute_train_data_HU_stats(src_path, training_ids, args.clip)
@@ -315,7 +325,7 @@ def main(args: argparse.Namespace):
                                  train_dataset_stats=datasets_stats,
                                  bspline=args.bspline,
                                  new_spacing=tuple(args.new_spacing))
-
+        
         resolutions: list[tuple[float, float, float]]
         iterator = tqdm_(split_ids)
         match args.process:
@@ -354,6 +364,8 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--new_spacing', type=float, nargs=3, default=[1.0, 1.0, 1.0])
     parser.add_argument('--bspline', action='store_true',
                      help="Resample volumes to isotropic spacing using B-spline interpolation before slicing.")
+    parser.add_argument('--val_patients', type=str, nargs="+", default=None,
+                    help="Explicit list of patient IDs to use for validation")
     args = parser.parse_args()
     random.seed(args.seed)
 
