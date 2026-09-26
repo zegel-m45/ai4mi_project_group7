@@ -23,6 +23,7 @@
 # SOFTWARE.
 
 import argparse
+import math
 import pickle
 import warnings
 from typing import Any
@@ -66,6 +67,10 @@ datasets_params["SEGTHOR_FINAL"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, '
 datasets_params["SEGTHOR_FINAL_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_clip_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_FINAL_clip_zscore_patient_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 # Source - https://stackoverflow.com/a/64584503 
 # Posted by yeachan park, modified by community. See post 'Timeline' for change history 
@@ -77,7 +82,6 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-
 
 def img_transform(img):
         if isinstance(img, np.ndarray):
@@ -106,17 +110,17 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     print(f">> Picked {device} to run experiments")
 
     K: int = datasets_params[args.dataset]['K']
-    kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
-    factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
+    kernels: int = args.kernels
+    factor: int = args.factor
     net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
     net.init_weights()
     net.to(device)
 
-    lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr,
+                                 betas=(args.beta1, args.beta2))
 
     # Dataset part
-    B: int = datasets_params[args.dataset]['B']
+    B: int = args.batch_size
     root_dir = Path("data") / args.dataset
 
     BAD_SLICES = {
@@ -157,10 +161,14 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
         }
 
 
-    if args.bspline_slices:
-        exclude_set = BAD_SLICES_BSPLINE 
-    else:
-        exclude_set = BAD_SLICES
+    # Legacy slice exclusions are disabled for the corrected dataset.
+    # To re-enable them, uncomment the if/else block below. Use
+    # --bspline_slices only for the B-spline-resampled slice numbering.
+    exclude_set = None
+    # if args.bspline_slices:
+    #     exclude_set = BAD_SLICES_BSPLINE
+    # else:
+    #     exclude_set = BAD_SLICES
 
     # Set seed to Dataloader
     generator = torch.Generator()
@@ -173,7 +181,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              debug=args.debug, exclude=exclude_set) #added
     train_loader = DataLoader(train_set,
                               batch_size=B,
-                              num_workers=5,
+                              num_workers=args.num_workers,
                               shuffle=True,
                               generator=generator)
 
@@ -184,7 +192,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            debug=args.debug, exclude=exclude_set) #added
     val_loader = DataLoader(val_set,
                             batch_size=B,
-                            num_workers=5,
+                            num_workers=args.num_workers,
                             shuffle=False,
                             generator=generator)
 
@@ -254,7 +262,7 @@ def runTraining(args):
                     B, _, W, H = img.shape
 
                     pred_logits = net(img)
-                    pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
+                    pred_probs = F.softmax(args.logit_scale * pred_logits, dim=1)
 
                     # Metrics computation, not used for training
                     pred_seg = probs2one_hot(pred_probs)
@@ -324,8 +332,9 @@ def runTraining(args):
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
 
 
-def main():
-    parser = argparse.ArgumentParser()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
@@ -338,10 +347,64 @@ def main():
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
     parser.add_argument('--bspline_slices', action='store_true',
-                     help="Use the bad-slice list for B-spline-resampled datasets")
+                     help="Select the B-spline bad-slice list only if the legacy "
+                          "exclusion block in setup() is uncommented; currently disabled.")
     parser.add_argument('--hd_percentile', type=int, default=95, choices=[90, 95, 99, 100], help="Percentile for Hausdorff distance computation")
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
-    args = parser.parse_args()
+    parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
+                        help="Adam learning rate.")
+    parser.add_argument('--beta1', type=float, default=0.9,
+                        help="Adam beta for the running average of gradients.")
+    parser.add_argument('--beta2', type=float, default=0.999,
+                        help="Adam beta for the running average of squared gradients.")
+    parser.add_argument('--batch-size', '--batch_size', type=int, default=None,
+                        help="Batch size for training and validation; None uses the dataset default "
+                             "(TOY2: 2, SEGTHOR variants: 8).")
+    parser.add_argument('--num-workers', '--num_workers', type=int, default=5,
+                        help="Data-loader workers; 0 loads data in the main process.")
+    parser.add_argument('--kernels', type=int, default=None,
+                        help="ENet base channel count, not spatial kernel size; "
+                             "None uses the dataset default (8). SEGTHOR only.")
+    parser.add_argument('--factor', type=int, default=None,
+                        help="ENet bottleneck channel-reduction factor; "
+                             "None uses the dataset default (2). SEGTHOR only.")
+    parser.add_argument('--logit-scale', '--logit_scale', type=float, default=1.0,
+                        help="Positive multiplier applied to logits before softmax "
+                             "during training and validation (inverse temperature).")
+    args = parser.parse_args(argv)
+
+    if args.dataset == 'TOY2' and (args.kernels is not None or args.factor is not None):
+        parser.error('--kernels and --factor apply only to ENet (SEGTHOR datasets).')
+
+    # Resolve dataset defaults before printing or using the hyperparameters.
+    params = datasets_params[args.dataset]
+    if args.batch_size is None:
+        args.batch_size = params['B']
+    if args.kernels is None:
+        args.kernels = params.get('kernels', 8)
+    if args.factor is None:
+        args.factor = params.get('factor', 2)
+
+    if args.epochs < 1:
+        parser.error('--epochs must be at least 1.')
+    if args.batch_size < 1:
+        parser.error('--batch-size must be at least 1.')
+    if args.num_workers < 0:
+        parser.error('--num-workers must be non-negative.')
+    if not math.isfinite(args.lr) or args.lr < 0:
+        parser.error('--lr must be finite and non-negative.')
+    if not (0 <= args.beta1 < 1) or not (0 <= args.beta2 < 1):
+        parser.error('--beta1 and --beta2 must each be in [0, 1).')
+    if args.kernels < 2 or not (1 <= args.factor <= args.kernels):
+        parser.error('--kernels must be at least 2 and --factor must be between 1 and --kernels.')
+    if not math.isfinite(args.logit_scale) or args.logit_scale <= 0:
+        parser.error('--logit-scale must be finite and greater than 0.')
+
+    return args
+
+
+def main():
+    args = parse_args()
 
     pprint(args)
     # Set seed
