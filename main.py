@@ -23,8 +23,8 @@
 # SOFTWARE.
 
 import argparse
+from html import parser
 import math
-import pickle
 import warnings
 from typing import Any
 from pathlib import Path
@@ -50,20 +50,23 @@ from utils import (Dcm,
                    probs2class,
                    tqdm_,
                    dice_coef,
-                   monai_percentile_hausdorff_distance,
                    save_images)
 
 from losses import (CrossEntropy)
 import random
+from stitch import main as stitch_predictions
+from evaluate_metrics_offline import evaluate_dice_and_hd_in_3d
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the classes with C (often used for the number of Channel)
 datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_baseline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 # Added
 datasets_params["SEGTHOR_FINAL"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_clip_bspline_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_FINAL_clip_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
@@ -204,11 +207,9 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
     net, optimizer, device, train_loader, val_loader, K = setup(args)
-    patient_spacing = None
-    if args.dataset != 'TOY2':
-        # spacing.pkl contains resized slice (row, column, through-plane) spacing
-        with open(Path('data') / args.dataset / 'spacing.pkl', 'rb') as f:
-            patient_spacing = pickle.load(f)
+    use_3d = (args.dataset != 'TOY2')
+    log_dice_3d, log_hd_3d = [], []
+    validation_patients = None
 
     if args.mode == "full":
         loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
@@ -223,7 +224,6 @@ def runTraining(args):
 
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
-    log_hd_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
     best_dice: float = 0
 
@@ -268,13 +268,6 @@ def runTraining(args):
                     pred_seg = probs2one_hot(pred_probs)
                     log_dice[e, j:j + B, :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
                     
-                    if m == 'val':
-                        spacing = None if patient_spacing is None else [
-                            [float(s) for s in patient_spacing[stem.rsplit('_', 1)[0]][:2]]
-                            for stem in data['stems']]
-                        log_hd_val[e, j:j + B, :] = monai_percentile_hausdorff_distance(
-                            pred_seg, gt, percentile=args.hd_percentile, spacing=spacing).detach().cpu()
-
                     loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
 
@@ -298,11 +291,6 @@ def runTraining(args):
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
-                    if m == 'val':
-                        postfix_dict[f"HD{args.hd_percentile}"] = f"{log_hd_val[e, :j, 1:].nanmean():05.3f}"
-                        if K > 2:
-                            postfix_dict |= {f"HD{args.hd_percentile}-{k}": f"{log_hd_val[e, :j, k].nanmean():05.3f}"
-                                             for k in range(1, K)}
                                  
                     tq_iter.set_postfix(postfix_dict)
 
@@ -311,13 +299,39 @@ def runTraining(args):
         np.save(args.dest / "dice_tra.npy", log_dice_tra)
         np.save(args.dest / "loss_val.npy", log_loss_val)
         np.save(args.dest / "dice_val.npy", log_dice_val)
-        np.save(args.dest / "hd_val.npy", log_hd_val)
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
+
+        if use_3d:
+            epoch_folder = args.dest / f"iter{e:03d}"
+            dice_3d, hd_3d, patients = evaluate_validation_3d(args, epoch_folder, K)
+            
+            if validation_patients is not None and patients != validation_patients:
+                raise ValueError('Validation patient order changed between epochs.')
+            validation_patients = patients
+            log_dice_3d.append(dice_3d)
+            np.save(args.dest / 'dice_3d_val.npy', np.asarray(log_dice_3d))
+
+            if args.calculate_val_3d_hd:
+                log_hd_3d.append(hd_3d)
+                np.save(args.dest / 'hd_3d_val.npy', np.asarray(log_hd_3d))
+
+            np.save(args.dest / 'patients_val.npy', np.asarray(patients))
+    
+            # Average patients across each foreground organ, then average across organs
+            current_dice = float(np.nanmean(np.nanmean(dice_3d[:, 1:], axis=0)))
+            if not np.isfinite(current_dice):
+                raise ValueError('No valid foreground 3D Dice for checkpoint selection.')
+           
+            # Delete this epoch's prediction PNGs and val folder after successful evaluation
+            for path in (epoch_folder / 'val').glob('*.png'):
+                path.unlink()
+            if not any((epoch_folder / 'val').iterdir()):
+                (epoch_folder / 'val').rmdir()
+
         if current_dice > best_dice:
-            current_hd = log_hd_val[e, :, 1:].nanmean().item()
-            message = (f">>> Improved dice at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC"
-                       f" | Validation HD{args.hd_percentile}: {current_hd:.3f}")
+            metric = "3D Dice" if use_3d else "2D Dice"
+            message = (f">>> Improved {metric} at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC")
             print(message)
             best_dice = current_dice
             with open(args.dest / "best_epoch.txt", 'w') as f:
@@ -330,6 +344,28 @@ def runTraining(args):
 
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
+
+
+def evaluate_validation_3d(args, epoch_folder, classes):
+    
+    # Reconstruct the 3D volumes from the 2D predictions
+    volumes = epoch_folder / "val_volumes"
+    stitch_predictions(argparse.Namespace(
+        data_folder=epoch_folder / "val", dest_folder=volumes,
+        grp_regex=r"(Patient_\d+)_\d+$", num_classes=255,
+        source_scan_pattern=args.source_scan_pattern,
+        bspline=args.bspline_slices or "bspline" in args.dataset.lower(),
+        new_spacing=args.new_spacing))
+    
+    # Evaluate the 3D Dice and optionally the 3D Hausdorff distance
+    results = evaluate_dice_and_hd_in_3d(argparse.Namespace(
+        pred_dir=volumes, gt_dir=args.gt_3d_dir, gt_pattern=args.gt_3d_pattern,
+        output_dir=epoch_folder / 'metrics_3d', classes=classes,
+        dice_only=not args.calculate_val_3d_hd, percentile=args.hd_percentile,
+        device='cuda' if args.gpu and torch.cuda.is_available() else 'cpu',
+        include_penalty=args.include_penalty))
+    
+    return results
 
 
 def parse_args(argv=None):
@@ -347,9 +383,18 @@ def parse_args(argv=None):
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
     parser.add_argument('--bspline_slices', action='store_true',
-                     help="Select the B-spline bad-slice list only if the legacy "
-                          "exclusion block in setup() is uncommented; currently disabled.")
-    parser.add_argument('--hd_percentile', type=int, default=95, choices=[90, 95, 99, 100], help="Percentile for Hausdorff distance computation")
+                     help="Reconstruct validation using the B-spline grid. Automatic for datasets containing 'bspline'.")
+    parser.add_argument('--calculate-val-3d-hd', '--calculate_val_3d_hd', action='store_true',
+                        help='Also evaluate 3D HD each epoch. Default computes only 3D Dice.')
+    parser.add_argument('--hd-percentile', '--hd_percentile', type=float, default=95,
+                        choices=[50, 90, 95, 100])
+    parser.add_argument('--include-penalty', action='store_true',
+                        help='Use the scan diagonal for one-empty 3D HD pairs.')
+    parser.add_argument('--source-scan-pattern', default='data/segthor_full/train/{id_}/{id_}.nii.gz')
+    parser.add_argument('--gt-3d-dir', type=Path, default=Path('data/segthor_full/train'))
+    parser.add_argument('--gt-3d-pattern', default='{patient}/GT.nii.gz')
+    parser.add_argument('--new-spacing', type=float, nargs=3, default=[1., 1., 1.],
+                        help='Spacing used when preprocessing B-spline datasets.')
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
                         help="Adam learning rate.")
@@ -373,6 +418,13 @@ def parse_args(argv=None):
                              "during training and validation (inverse temperature).")
     args = parser.parse_args(argv)
 
+    if args.debug and args.dataset != 'TOY2':
+        parser.error('3D validation needs complete patients. --debug truncates the slices.')
+    if args.calculate_val_3d_hd and args.dataset == 'TOY2':
+        parser.error('--calculate-val-3d-hd requires a SEGTHOR dataset.')
+    valid_spacing = [math.isfinite(s) and s > 0 for s in args.new_spacing]
+    if not all(valid_spacing):
+        parser.error('--new-spacing values must be finite and positive.')
     if args.dataset == 'TOY2' and (args.kernels is not None or args.factor is not None):
         parser.error('--kernels and --factor apply only to ENet (SEGTHOR datasets).')
 
