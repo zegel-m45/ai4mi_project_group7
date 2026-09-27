@@ -39,6 +39,8 @@ from skimage.transform import resize
 from utils import map_, tqdm_
 import nibabel.processing as nibproc
 
+from PIL import Image
+from elasticdeform import deform_random_grid
 
 def compute_train_data_HU_stats(source_path: Path, ids: list[str], clip: bool = False) -> dict[str, float]:
     """
@@ -164,12 +166,8 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     gt: np.ndarray
     if not test_mode:
-        # Differentiate between used groundtruths
-        if id_ == "Patient_07":
-            gt_filename = "GT2.nii.gz" 
-        else:
-             gt_filename = "GT_split.nii.gz"
-        gt_path: Path = id_path / gt_filename
+        # Revert old gt file name split
+        gt_path: Path = id_path / "GT.nii.gz"
         gt_nib = nib.load(str(gt_path))
         # print(nib_obj.affine, gt_nib.affine)
         gt = np.asarray(gt_nib.dataobj)
@@ -257,6 +255,135 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     # Saved slices are transposed then resized recording (row, column, z) in mm
     return dy * y / shape[0], dx * x / shape[1], dz
 
+def generate_augmented_copies(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int], test_mode: bool = False,
+                               clip: bool = False, norm="minmax", norm_scope="train_dataset",
+                               train_dataset_stats: dict | None = None,
+                               bspline: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
+                               noise_p: float = 0.0, elastic_p: float = 0.0,
+                               elastic_sigma: float = 2.0, elastic_points: int = 2) -> None:
+
+    apply_noise = random.random() < noise_p
+    apply_elastic = random.random() < elastic_p
+
+    if not apply_noise and not apply_elastic:
+        return  # nothing to do for this copy — no file written
+    
+    id_path: Path = source_path / ("train" if not test_mode else "test") / id_
+
+    ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
+    nib_obj = nib.load(str(ct_path))
+    ct: np.ndarray = np.asarray(nib_obj.dataobj)
+    # dx, dy, dz = nib_obj.header.get_zooms()
+    x, y, z = ct.shape
+    dx, dy, dz = nib_obj.header.get_zooms()
+
+    assert sanity_ct(ct, *ct.shape, *nib_obj.header.get_zooms())
+
+    # CLIPPING HU ranges before normalization
+    if clip:
+        ct = np.clip(ct, -1000, 1000)
+        nib_obj = nib.Nifti1Image(ct, affine=nib_obj.affine, header=nib_obj.header)
+
+    gt: np.ndarray
+    if not test_mode:
+        # Revert old gt file name split
+        gt_path: Path = id_path / "GT.nii.gz"
+        gt_nib = nib.load(str(gt_path))
+        # print(nib_obj.affine, gt_nib.affine)
+        gt = np.asarray(gt_nib.dataobj)
+        assert sanity_gt(gt, ct)
+        gt_nib = nib.Nifti1Image(gt, affine=gt_nib.affine, header=gt_nib.header)
+    else:
+        gt_nib = nib.Nifti1Image(np.zeros_like(ct, dtype=np.uint8), affine=nib_obj.affine)
+        gt = np.asarray(gt_nib.dataobj)
+
+    # RESAMPLING USING B-SPLINE INTERPOLATION
+    if bspline:
+        ct_resampled_nib = nibproc.resample_to_output(nib_obj, voxel_sizes=new_spacing, order=3, mode='nearest')
+        gt_resampled_nib = nibproc.resample_from_to(gt_nib, ct_resampled_nib, order=0, mode='nearest')
+
+        ct = np.asarray(ct_resampled_nib.dataobj)
+        gt = np.asarray(gt_resampled_nib.dataobj).astype(np.uint8)
+
+        ct = np.flip(ct, axis=(0, 1))
+        gt = np.flip(gt, axis=(0, 1))
+
+        x, y, z = ct.shape
+        dx, dy, dz = ct_resampled_nib.header.get_zooms()
+
+    # ELASTIC DEFORMATION to CT + GT
+    if apply_elastic:
+        [ct, gt] = deform_random_grid(
+            [ct, gt],
+            sigma=elastic_sigma,
+            points=elastic_points, #paper used 2x2x2
+            order=[3, 0],  #cubic for CT, nearest-neighbor for GT
+            axis=(0, 1, 2), #all 3 axis
+        )
+        assert set(np.unique(gt)) <= {0, 1, 2, 3, 4}, "GT interpolation artifact detected!" #sanity check
+
+    # NORMALIZATION
+    if norm_scope == "train_dataset":
+        assert train_dataset_stats is not None, "train_dataset_stats must be provided for 'train_dataset' normalization scope"
+        if norm == "minmax":
+            norm_ct: np.ndarray = norm_arr_fixed(ct, train_dataset_stats["min"], train_dataset_stats["max"])
+        elif norm == "zscore":
+            norm_ct: np.ndarray = zscore_arr_fixed(ct, train_dataset_stats["mean"], train_dataset_stats["std"])
+        else:
+            raise ValueError(f"Invalid normalization method: {norm}. Must be 'minmax' or 'zscore'.")
+    elif norm_scope == "patient":
+        if norm == "minmax":
+            norm_ct: np.ndarray = norm_arr(ct)
+        elif norm == "zscore":
+            norm_ct: np.ndarray = zscore_arr_fixed(ct, ct.mean(), ct.std())
+        else:
+            raise ValueError(f"Invalid normalization method: {norm}. Must be 'minmax' or 'zscore'.")
+    else:
+        raise ValueError(f"Invalid norm_scope: {norm_scope}. Must be 'train_dataset' or 'patient'.")
+
+    # GAUSSIAN NOISE — applied after normalization, on the already-normalized volume
+    if apply_noise:
+        variance = np.random.uniform(0, 0.1)
+        sigma = np.sqrt(variance)
+        noise = np.random.normal(0, sigma, norm_ct.shape)
+        norm_ct = (norm_ct + noise).astype(np.float32)
+
+    # Build a filename tag reflecting which augmentations were actually applied
+    tag_parts = []
+    if apply_elastic:
+        tag_parts.append("elastic")
+    if apply_noise:
+        tag_parts.append("noise")
+    tag = "_" + "_".join(tag_parts)
+
+    to_slice_ct = norm_ct
+    to_slice_gt = gt
+
+    for idz in range(z):
+        img_slice = resize_(to_slice_ct[:, :, idz].T, shape).astype(np.float32 if norm == "zscore" else np.uint8)
+        gt_slice = resize_(to_slice_gt[:, :, idz].T, shape, order=0).astype(np.uint8)
+        assert img_slice.shape == gt_slice.shape
+        gt_slice *= 63
+        assert gt_slice.dtype == np.uint8, gt_slice.dtype
+        assert set(np.unique(gt_slice)) <= set([0, 63, 126, 189, 252]), np.unique(gt_slice)
+
+        arrays: list[np.ndarray] = [img_slice, gt_slice]
+        subfolders: list[str] = ["img", "gt"]
+
+        for save_subfolder, data in zip(subfolders, arrays):
+            filename = f"{id_}_{idz:04d}{tag}.png"
+
+            save_path: Path = Path(dest_path, save_subfolder)
+            save_path.mkdir(parents=True, exist_ok=True)
+
+            if save_subfolder == "img" and norm == "zscore":
+                np.save((save_path / filename).with_suffix(".npy"), data)
+                continue
+
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning)
+                imsave(str(save_path / filename), data)
+                # Spacing is not saved!
 
 def get_splits(src_path: Path, retains: int, fold: int, val_patients: list[str] | None = None) -> tuple[list[str], list[str], list[str]]:
     ids: list[str] = sorted(map_(lambda p: p.name, (src_path / 'train').glob('*')))
@@ -343,6 +470,26 @@ def main(args: argparse.Namespace):
         pickle.dump(resolution_dict, f, pickle.HIGHEST_PROTOCOL)
         print(f"Saved spacing dictionnary to {f}")
 
+    if args.augment_noise or args.elastic:
+        print(f"Generating augmented copies (noise_p={args.noise_p if args.augment_noise else 0}, "
+          f"elastic_p={args.elastic_p if args.elastic else 0})...")
+    for id_ in training_ids:
+        generate_augmented_copies(
+            id_=id_,
+            dest_path=dest_path / "train",
+            source_path=src_path,
+            shape=tuple(args.shape),
+            clip=args.clip,
+            norm=args.norm,
+            norm_scope=args.norm_scope,
+            train_dataset_stats=datasets_stats,
+            bspline=args.bspline,
+            new_spacing=tuple(args.new_spacing),
+            noise_p=args.noise_p if args.augment_noise else 0.0,
+            elastic_p=args.elastic_p if args.elastic else 0.0,
+            elastic_sigma=args.elastic_sigma,
+            elastic_points=args.elastic_points,
+        )
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Slicing parameters')
@@ -366,6 +513,17 @@ def get_args() -> argparse.Namespace:
                      help="Resample volumes to isotropic spacing using B-spline interpolation before slicing.")
     parser.add_argument('--val_patients', type=str, nargs="+", default=None,
                     help="Explicit list of patient IDs to use for validation")
+    parser.add_argument('--augment_noise', action='store_true',
+                 help="Generate offline noise-augmented copies of training slices after slicing.")
+    parser.add_argument('--n_noise_copies', type=int, default=2,
+                    help="Number of noisy copies to generate per training slice.")
+    parser.add_argument('--noise_p', type=float, default=0.15,
+                    help="Probability of applying noise to each copy.")
+    parser.add_argument('--elastic', action='store_true',
+                 help="Generate offline elastic-deformed copies of training volumes.")
+    parser.add_argument('--elastic_sigma', type=float, default=2.0)
+    parser.add_argument('--elastic_points', type=int, default=2)
+    parser.add_argument('--elastic_p', type=float, default=0.2)
     args = parser.parse_args()
     random.seed(args.seed)
 
