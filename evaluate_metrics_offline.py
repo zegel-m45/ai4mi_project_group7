@@ -9,7 +9,10 @@ python evaluate_metrics_offline.py --dimensionality 3 --pred-dir volumes/YOUR_RU
   --gt-dir data/segthor_part1/train --gt-pattern '{patient}/GT_split.nii.gz' \
   --output-dir results/YOUR_RUN/metrics_3d --percentile 95
 
-FP/FN are slice-class presence errors, not pixel counts. HD is computed only when both masks contain the class.
+FP/FN are slice-class (2D) or patient-class (3D) presence errors, not pixel/voxel counts.
+HD is computed only when both masks contain the class.
+Add --include-penalty to assign the physical image diagonal to one-empty pairs.
+Both-empty pairs always get zero HD, regardless of the penalty flag.
 2D outputs have shape (slices, classes).
 3D outputs have shape (patients, classes).
 """
@@ -25,6 +28,18 @@ from PIL import Image
 from monai.metrics import compute_hausdorff_distance
 from monai.metrics import compute_dice
 
+
+def metric_device(args):
+    requested = args.device
+    if requested == 'auto':
+        requested = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    device = torch.device(requested)
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA is unavailable; use --device cpu or --device auto.')
+
+    print(f'Metric device: {device}')
+    return device
 
 def read_labels(path, classes):
     """
@@ -54,6 +69,7 @@ def evaluate_hd_in_2d(args):
     """
     Evaluate Hausdorff distance and presence errors for a single prediction directory.
     """
+    device = metric_device(args)
     files = sorted(args.pred_dir.glob('*.png'))  # use filename order consistently across all output arrays
     assert files, f'No prediction PNGs found in {args.pred_dir}'
 
@@ -64,6 +80,7 @@ def evaluate_hd_in_2d(args):
     hd_values = np.full(shape, np.nan, dtype=np.float32)
     false_positives = np.zeros(shape, dtype=bool)
     false_negatives = np.zeros(shape, dtype=bool)
+    gt_counts = np.zeros(args.classes, dtype=int)
     slice_names = []
 
     for slice_index, path in enumerate(files):
@@ -77,26 +94,31 @@ def evaluate_hd_in_2d(args):
         spacing = np.asarray(spacings[patient][:2], dtype=float)
 
         assert spacing.shape == (2,) and np.all(np.isfinite(spacing) & (spacing > 0)), f'{patient}: invalid in-plane spacing {spacing}'
+        penalty = np.linalg.norm(np.asarray(pred.shape) * spacing) if args.include_penalty else np.nan
 
         for k in range(1, args.classes):  # skip background
             prediction = pred == k
             target = gt == k
             pred_present = prediction.any()
             gt_present = target.any()
+            gt_counts[k] += gt_present
 
             # count presence errors per slice and organ, not pixels
             if pred_present and not gt_present:
                 false_positives[slice_index, k] = True
+                hd_values[slice_index, k] = penalty
                 continue
             if gt_present and not pred_present:
                 false_negatives[slice_index, k] = True
+                hd_values[slice_index, k] = penalty
                 continue
             if not pred_present and not gt_present:
+                hd_values[slice_index, k] = 0
                 continue
 
             # add batch and channel dimensions for MONAI 
-            prediction_tensor = torch.from_numpy(prediction).unsqueeze(0).unsqueeze(0)
-            target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0)
+            prediction_tensor = torch.from_numpy(prediction).unsqueeze(0).unsqueeze(0).to(device)
+            target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0).to(device)
             
             hd = compute_hausdorff_distance(
                 prediction_tensor,
@@ -130,7 +152,7 @@ def evaluate_hd_in_2d(args):
             std_hd = float('nan')
         fp_count = false_positives[:, k].sum()
         fn_count = false_negatives[:, k].sum()
-        gt_present_count = valid_count + fn_count
+        gt_present_count = gt_counts[k]
         print(f'Class {k}: HD{args.percentile:g} mean={mean_hd:.3f} mm, std={std_hd:.3f} mm, '
               f'total={len(files)}, valid={valid_count}, invalid={len(files) - valid_count}, '
               f'FP={fp_count}, FN={fn_count}, '
@@ -140,6 +162,8 @@ def evaluate_hd_in_2d(args):
 
 
 def evaluate_dice_and_hd_in_3d(args):
+    dice_only = getattr(args, 'dice_only', False)
+    device = metric_device(args)
     files = sorted(args.pred_dir.glob('*.nii.gz'))
     assert files, f'No stitched NIfTI files found in {args.pred_dir}'
 
@@ -147,6 +171,8 @@ def evaluate_dice_and_hd_in_3d(args):
     shape = (len(files), args.classes)
     dice_values = np.full(shape, np.nan, dtype=np.float32)
     hd_values = np.full(shape, np.nan, dtype=np.float32)
+    false_positives = np.zeros(shape, dtype=bool)
+    false_negatives = np.zeros(shape, dtype=bool)
 
     for patient_index, path in enumerate(files):
         patient = path.name.removesuffix('.nii.gz')
@@ -167,12 +193,26 @@ def evaluate_dice_and_hd_in_3d(args):
         assert np.isin(pred, range(args.classes)).all(), f'{patient}: unexpected prediction labels'
         assert np.isin(gt, range(args.classes)).all(), f'{patient}: unexpected GT labels'
 
-        # get voxel spacing
-        spacing = []
-        for value in pred_image.header.get_zooms():
-            assert np.isfinite(value) and value > 0, f'{patient}: invalid voxel spacing'
-            spacing.append(float(value))
-        assert len(spacing) == 3, f'{patient}: expected three spacing values'
+        if not dice_only:
+            # get voxel spacing
+            spacing = []
+            for value in pred_image.header.get_zooms():
+                assert np.isfinite(value) and value > 0, f'{patient}: invalid voxel spacing'
+                spacing.append(float(value))
+            assert len(spacing) == 3, f'{patient}: expected three spacing values'
+            
+            units = pred_image.header.get_xyzt_units()[0]
+            assert units in ('mm', 'meter', 'micron'), f'{patient}: unknown spatial units'
+            
+            # convert spatial units to mm before using the scan diagonal
+            spacing = np.asarray(spacing)
+            if units == "meter":
+                spacing = spacing * 1000
+            elif units == "micron":
+                spacing = spacing / 1000
+            spacing = spacing.tolist()
+            # parallelepiped diagonal: sqrt(sum((scan shape * voxel spacing)**2)) -> Euclidean norm
+            penalty = np.linalg.norm(np.asarray(pred.shape) * spacing) if args.include_penalty else np.nan
 
         for k in range(1, args.classes):  # skip background
             prediction = pred == k
@@ -180,13 +220,21 @@ def evaluate_dice_and_hd_in_3d(args):
             pred_present = prediction.any()
             gt_present = target.any()
         
+            # count organ-presence errors
+            false_positives[patient_index, k] = pred_present and not gt_present
+            false_negatives[patient_index, k] = gt_present and not pred_present
+
             if not pred_present and not gt_present:
-                print(f"Warning: Both prediction and ground truth are empty for patient {patient}, class {k}. Skipping Dice and HD computation.")
+                if dice_only:
+                    print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN.")
+                    continue
+                hd_values[patient_index, k] = 0
+                print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN, HD={hd_values[patient_index, k]}.")
                 continue
 
             # Add batch and channel dimensions for MONAI
-            prediction_tensor = torch.from_numpy(prediction).unsqueeze(0).unsqueeze(0)
-            target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0)
+            prediction_tensor = torch.from_numpy(prediction).unsqueeze(0).unsqueeze(0).to(device)
+            target_tensor = torch.from_numpy(target).unsqueeze(0).unsqueeze(0).to(device)
             dice = compute_dice(
                 prediction_tensor,
                 target_tensor,
@@ -194,8 +242,10 @@ def evaluate_dice_and_hd_in_3d(args):
                 ignore_empty=False).item()
             
             dice_values[patient_index, k] = dice
+            if dice_only:
+                continue
 
-            # HD needs both surfaces - leave it as NaN if either is empty
+            # HD needs both surfaces
             if pred_present and gt_present:
                 hd = compute_hausdorff_distance(
                     prediction_tensor,
@@ -207,11 +257,16 @@ def evaluate_dice_and_hd_in_3d(args):
                     spacing=spacing).item()
            
                 hd_values[patient_index, k] = hd
+            else: # optionally penalize a one-empty pair
+                hd_values[patient_index, k] = penalty
 
     # Save results
     args.output_dir.mkdir(parents=True, exist_ok=True)
     np.save(args.output_dir / 'dice_3d_val.npy', dice_values)
-    np.save(args.output_dir / 'hd_3d_val.npy', hd_values)
+    if not dice_only:
+        np.save(args.output_dir / 'hd_3d_val.npy', hd_values)
+    np.save(args.output_dir / 'fp_3d_val.npy', false_positives)
+    np.save(args.output_dir / 'fn_3d_val.npy', false_negatives)
     np.save(args.output_dir / 'patients_val.npy', np.asarray(patient_names))
 
     # Collect defined scores for each organ, then average across patients
@@ -239,11 +294,16 @@ def evaluate_dice_and_hd_in_3d(args):
             std_dice = np.std(valid_dice)
 
         total = len(patient_names)
-        print(f'Class {k}: total patients={total}')
+        print(f'Class {k}: total patients={total}, '
+              f'FP={false_positives[:, k].sum()} FN={false_negatives[:, k].sum()}')
         print(f'  Dice: mean={mean_dice:.3f}, std={std_dice:.3f}, '
               f'valid={len(valid_dice)}, invalid={total - len(valid_dice)}')
-        print(f'  HD{args.percentile:g}: mean={mean_hd:.3f} mm, std={std_hd:.3f} mm, '
-              f'valid={len(valid_hd)}, invalid={total - len(valid_hd)}')
+        if not dice_only:
+            print(f'  HD{args.percentile:g}: mean={mean_hd:.3f} mm, std={std_hd:.3f} mm, '
+                  f'valid={len(valid_hd)}, invalid={total - len(valid_hd)}')
+
+
+    return dice_values, hd_values, patient_names
 
 
 if __name__ == '__main__':
@@ -259,9 +319,16 @@ if __name__ == '__main__':
     parser.add_argument('--classes', type=int, default=5)
     parser.add_argument('--percentile', type=float, choices=[50, 90, 95, 100], default=95)
     parser.add_argument('--dimensionality', type=int, choices=[2, 3], default=3)
+    parser.add_argument('--dice-only', action='store_true',
+                        help='For 3D only: skip HD computation and saving, while keeping Dice, FP/FN and patient IDs')
+    parser.add_argument('--include-penalty', action='store_true',
+                        help='Use the physical diagonal for one-empty masks. The default leaves them as NaN.')
+    parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='auto',
+                        help='Device used for metric computation.')
     args = parser.parse_args()
 
     assert 2 <= args.classes <= 256, 'classes must be 2..256'
+    assert not args.dice_only or args.dimensionality == 3, '--dice-only requires --dimensionality 3'
 
     if args.dimensionality == 2:
         assert args.spacing_file is not None, '--spacing-file is required for 2D evaluation'
