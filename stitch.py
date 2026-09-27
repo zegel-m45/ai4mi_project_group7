@@ -53,7 +53,11 @@ def merge_patient(id_: str, dest_folder: str, images: list[Path],
     # Recreate the grid used by resample_to_output in slice_segthor.py
     shape, affine = vox2out_vox((orig_shape, orig_nib.affine), new_spacing) if bspline else (orig_shape, orig_nib.affine)
     X, Y, Z = shape
-    assert sorted(get_z(images[i]) for i in idxes) == list(range(Z)), "Missing, duplicate, or unexpected slices"
+
+    slice_indices = [get_z(images[i]) for i in idxes]
+    expected_indices = list(range(Z))
+    if sorted(slice_indices) != expected_indices:
+        raise ValueError(f"{id_}: missing, duplicate, or unexpected slices")
 
     res_arr: np.ndarray = np.zeros((X, Y, Z), dtype=np.int16)
 
