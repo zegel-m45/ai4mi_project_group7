@@ -25,11 +25,21 @@
 from pathlib import Path
 from typing import Callable, Union
 
-from torch import Tensor
+from torch import Tensor, randn_like
 from PIL import Image
 import numpy as np # added for npy images produced by z-scoring
 from torch.utils.data import Dataset
 
+# ERROR FIX
+def gt_stem_for(image_stem: str) -> str:
+    """
+    Noise-only augmentations don't modify labels, so they share the GT of the
+    original slice. '_elastic_noise' is NOT noise-only (the GT was deformed),
+    so it keeps its own GT file.
+    """
+    if image_stem.endswith("_noise") and not image_stem.endswith("_elastic_noise"):
+        return image_stem[:-len("_noise")]
+    return image_stem
 
 def make_dataset(root, subset, exclude: set[str] | None = None) -> list[tuple[Path, Path | None]]:
     assert subset in ['train', 'val', 'test']
@@ -43,7 +53,7 @@ def make_dataset(root, subset, exclude: set[str] | None = None) -> list[tuple[Pa
     images: list[Path] = sorted([*img_path.glob("*.png"), *img_path.glob("*.npy")]) # added npy images produced by z-scoring
     full_labels: list[Path | None]
     if subset != 'test':
-        full_labels = [full_path / f"{image.stem}.png" for image in images] # go through images produced by z-scoring as well
+        full_labels = [full_path / f"{gt_stem_for(image.stem)}.png" for image in images] # go through images produced by z-scoring as well
     else:
         full_labels = [None] * len(images)
 
@@ -83,6 +93,10 @@ class SliceDataset(Dataset):
 
         img: Tensor = self.img_transform(np.load(img_path, allow_pickle=False) if img_path.suffix == '.npy' else Image.open(img_path)) # added npy for images produced by z-scoring
 
+        # # Apply noise (training only!)
+        # if self.augmentation and not self.test_mode:
+        #     img = add_noise(img, p=0.2)
+            
         data_dict = {"images": img,
                      "stems": img_path.stem}
 
