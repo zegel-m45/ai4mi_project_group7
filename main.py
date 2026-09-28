@@ -52,7 +52,7 @@ from utils import (Dcm,
                    dice_coef,
                    save_images)
 
-from losses import (CrossEntropy)
+from losses import (CrossEntropy, CombinedLoss)
 import random
 from stitch import main as stitch_predictions
 from evaluate_metrics_offline import evaluate_dice_and_hd_in_3d
@@ -212,11 +212,18 @@ def runTraining(args):
     validation_patients = None
 
     if args.mode == "full":
-        loss_fn = CrossEntropy(idk=list(range(K)))  # Supervise both background and foreground
+        idk = list(range(K))  # Supervise both background and foreground
     elif args.mode in ["partial"] and args.dataset == 'SEGTHOR':
-        loss_fn = CrossEntropy(idk=[0, 1, 3, 4])  # Do not supervise the heart (class 2)
+        idk = [0, 1, 3, 4]  # Do not supervise the heart (class 2)
     else:
         raise ValueError(args.mode, args.dataset)
+
+    if args.loss == "ce":
+        loss_fn = CrossEntropy(idk=idk)
+    elif args.loss == "combined":
+        loss_fn = CombinedLoss(idk=idk, alpha=args.dice_alpha, generalized=args.generalized_dice)
+    else:
+        raise ValueError(args.loss)
 
     # Notice one has the length of the _loader_, and the other one of the _dataset_
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
@@ -374,14 +381,21 @@ def parse_args(argv=None):
 
     parser.add_argument('--epochs', default=20, type=int)
     parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
-    parser.add_argument('--mode', default='full', choices=['partial', 'full'])
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
-
     parser.add_argument('--gpu', action='store_true')
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
+    # Loss params
+    parser.add_argument('--mode', default='full', choices=['partial', 'full'])
+    parser.add_argument('--loss', default='ce', choices=['ce', 'combined'],
+                        help="ce: plain cross-entropy. combined: CE + (Generalized) Dice.")
+    parser.add_argument('--dice-alpha', '--dice_alpha', type=float, default=0.5,
+                        help="Weight of CE vs Dice for combined loss")
+    parser.add_argument('--generalized-dice', '--generalized_dice', action='store_true',
+                        help="Use GeneralizedDiceLoss instead of DiceLoss")
+
     parser.add_argument('--bspline_slices', action='store_true',
                      help="Reconstruct validation using the B-spline grid. Automatic for datasets containing 'bspline'.")
     parser.add_argument('--calculate-val-3d-hd', '--calculate_val_3d_hd', action='store_true',

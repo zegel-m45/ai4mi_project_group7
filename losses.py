@@ -24,8 +24,36 @@
 
 
 from torch import einsum
-
+from monai.losses import DiceLoss, GeneralizedDiceLoss
 from utils import simplex, sset
+
+class CombinedLoss():
+    def __init__(self, idk, alpha=0.5, generalized=False):
+        self.idk = idk
+        self.alpha = alpha # scalar for which loss gets more weight
+        self.ce = CrossEntropy(idk=idk)
+        dice_loss = GeneralizedDiceLoss if generalized else DiceLoss
+        # In main.py we already apply F.softmax (so therefore False here)
+        self.dice = dice_loss(include_background=True, softmax=False, reduction="mean")
+        # ^ The GeneralizedDiceLoss has batch=False by default. This is important because now the volume is
+        # computed per slice! If we set batch=True, it will take the volume of the batch I believe, 
+        # but the batch during training can be multiple patients (training dataloader has shuffle=True).
+        # Thus that volume does not make sense I think to use.
+
+        print(f"Initialized {self.__class__.__name__} with idk={idk}, alpha={alpha}, generalized={generalized}")
+
+    def __call__(self, pred_softmax, weak_target):
+        assert pred_softmax.shape == weak_target.shape
+        assert simplex(pred_softmax)
+        assert sset(weak_target, [0, 1])
+
+        ce_loss = self.ce(pred_softmax, weak_target)
+
+        pred = pred_softmax[:, self.idk, ...]
+        gt = weak_target[:, self.idk, ...].float()
+        dice_loss = self.dice(pred, gt)
+
+        return self.alpha * ce_loss + (1 - self.alpha) * dice_loss
 
 
 class CrossEntropy():
