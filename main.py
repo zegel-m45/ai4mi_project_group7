@@ -64,16 +64,12 @@ datasets_params["TOY2"] = {'K': 2, 'net': shallowCNN, 'B': 2, 'kernels': 8, 'fac
 datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_baseline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-# Added
-datasets_params["SEGTHOR_FINAL"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_clip_bspline_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_clip"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_clip_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_minmax_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_zscore_dataset"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_zscore_patient"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
-datasets_params["SEGTHOR_FINAL_clip_zscore_patient_bspline"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_augmented"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_gaussian"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_elastic"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_elastic_xy"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_elastic_Vnet"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 # Source - https://stackoverflow.com/a/64584503 
 # Posted by yeachan park, modified by community. See post 'Timeline' for change history 
@@ -240,7 +236,8 @@ def runTraining(args):
         log_ce_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
         log_dice_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
 
-    best_dice: float = 0
+    best_dice: float = float('-inf')
+    patience: int = args.patience
 
     # For organizing the logs/metrics during training/validation
     (args.dest / "losses").mkdir(parents=True, exist_ok=True)
@@ -327,17 +324,17 @@ def runTraining(args):
                     tq_iter.set_postfix(postfix_dict)
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
-        np.save(args.dest / "losses/loss_tra.npy", log_loss_tra)   # Can be CE or combined
-        np.save(args.dest / "metrics/dice_tra.npy", log_dice_tra)  # Hard dice -> metric only
-        np.save(args.dest / "losses/loss_val.npy", log_loss_val)
-        np.save(args.dest / "metrics/dice_val.npy", log_dice_val)
+        np.save(args.dest / "loss_tra.npy", log_loss_tra[:e + 1]) # Can be CE or combined
+        np.save(args.dest / "dice_tra.npy", log_dice_tra[:e + 1]) # Hard dice -> metric only
+        np.save(args.dest / "loss_val.npy", log_loss_val[:e + 1])
+        np.save(args.dest / "dice_val.npy", log_dice_val[:e + 1])
 
         if args.loss == "combined":
-            np.save(args.dest / "losses/ce_loss_tra.npy", log_ce_sep_tra)
-            np.save(args.dest / "losses/dice_loss_tra.npy", log_dice_sep_tra)  # Soft dice (allows gradient)
-            np.save(args.dest / "losses/ce_loss_val.npy", log_ce_sep_val)
-            np.save(args.dest / "losses/dice_loss_val.npy", log_dice_sep_val)
-
+            np.save(args.dest / "losses/ce_loss_tra.npy", log_ce_sep_tra[:e + 1])
+            np.save(args.dest / "losses/dice_loss_tra.npy", log_dice_sep_tra[:e + 1])  # Soft dice (allows gradient)
+            np.save(args.dest / "losses/ce_loss_val.npy", log_ce_sep_val[:e + 1])
+            np.save(args.dest / "losses/dice_loss_val.npy", log_dice_sep_val[:e + 1])
+        
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
 
         if use_3d:
@@ -367,7 +364,10 @@ def runTraining(args):
             if not any((epoch_folder / 'val').iterdir()):
                 (epoch_folder / 'val').rmdir()
 
+        patience -= 1
+        
         if current_dice > best_dice:
+            patience = args.patience
             metric = "3D Dice" if use_3d else "2D Dice"
             message = (f">>> Improved {metric} at epoch {e}: {best_dice:05.3f}->{current_dice:05.3f} DSC")
             print(message)
@@ -382,6 +382,10 @@ def runTraining(args):
 
             torch.save(net, args.dest / "bestmodel.pkl")
             torch.save(net.state_dict(), args.dest / "bestweights.pt")
+
+        if patience == 0:
+            print(f"Validation Dice has not improved for the past {args.patience} epochs. Stopping early.")
+            break
 
 
 def evaluate_validation_3d(args, epoch_folder, classes):
@@ -441,6 +445,7 @@ def parse_args(argv=None):
     parser.add_argument('--new-spacing', type=float, nargs=3, default=[1., 1., 1.],
                         help='Spacing used when preprocessing B-spline datasets.')
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
+    parser.add_argument('--patience', type=int, default=10, help="Patience for early stopping.")
     parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
                         help="Adam learning rate.")
     parser.add_argument('--beta1', type=float, default=0.9,
@@ -484,6 +489,10 @@ def parse_args(argv=None):
 
     if args.epochs < 1:
         parser.error('--epochs must be at least 1.')
+    if args.patience < 1:
+        parser.error('--patience must be at least 1.')
+    if not 0 <= args.dice_alpha <= 1:
+        parser.error('--dice-alpha must be between 0 and 1.')
     if args.batch_size < 1:
         parser.error('--batch-size must be at least 1.')
     if args.num_workers < 0:
