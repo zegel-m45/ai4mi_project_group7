@@ -40,6 +40,10 @@ class CombinedLoss():
         # but the batch during training can be multiple patients (training dataloader has shuffle=True).
         # Thus that volume does not make sense I think to use.
 
+        # For logging
+        self.last_ce = 0.0
+        self.last_dice = 0.0
+
         print(f"Initialized {self.__class__.__name__} with idk={idk}, alpha={alpha}, generalized={generalized}")
 
     def __call__(self, pred_softmax, weak_target):
@@ -52,6 +56,9 @@ class CombinedLoss():
         pred = pred_softmax[:, self.idk, ...]
         gt = weak_target[:, self.idk, ...].float()
         dice_loss = self.dice(pred, gt)
+
+        self.last_ce = ce_loss.item()
+        self.last_dice = dice_loss.item()
 
         return self.alpha * ce_loss + (1 - self.alpha) * dice_loss
 
