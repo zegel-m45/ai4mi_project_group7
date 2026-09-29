@@ -40,7 +40,7 @@ from utils import map_, tqdm_
 import nibabel.processing as nibproc
 
 from PIL import Image
-from elasticdeform import deform_random_grid
+from elasticdeform import deform_random_grid, deform_grid
 
 def compute_train_data_HU_stats(source_path: Path, ids: list[str], clip: bool = False) -> dict[str, float]:
     """
@@ -313,15 +313,21 @@ def generate_augmented_copies(id_: str, dest_path: Path, source_path: Path, shap
 
     # ELASTIC DEFORMATION to CT + GT
     if apply_elastic:
-        [ct, gt] = deform_random_grid(
-            [ct, gt],
-            sigma=elastic_sigma,
-            points=elastic_points, #paper used 2x2x2
-            order=[3, 0],  #cubic for CT, nearest-neighbor for GT
-            axis=(0, 1, 2), #all 3 axis
-        )
-        assert set(np.unique(gt)) <= {0, 1, 2, 3, 4}, "GT interpolation artifact detected!" #sanity check
+        # Build the random displacement field ourselves, so we can zero out the z-axis
+        displacement = np.random.randn(3, elastic_points, elastic_points, elastic_points) * elastic_sigma
 
+        # Axis order here matches axis=(0,1,2)=(x, y, z); zero out z (index 2)
+        # since z-resolution is coarse/anisotropic relative to x/y
+        displacement[2] = 0
+
+        ct, gt = deform_grid(
+            [ct, gt],
+            displacement,
+            order=[3, 0],   # cubic for CT, nearest-neighbor for GT
+            axis=(0, 1, 2),
+        )
+        assert set(np.unique(gt)) <= {0, 1, 2, 3, 4}, "GT interpolation artifact detected!"
+        
     # NORMALIZATION
     if norm_scope == "train_dataset":
         assert train_dataset_stats is not None, "train_dataset_stats must be provided for 'train_dataset' normalization scope"
