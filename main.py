@@ -226,13 +226,25 @@ def runTraining(args):
         raise ValueError(args.loss)
 
     # Notice one has the length of the _loader_, and the other one of the _dataset_
+    # Here, the loss is the total loss (either CE only, or combined loss)
     log_loss_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
     log_dice_tra: Tensor = torch.zeros((args.epochs, len(train_loader.dataset), K))
 
     log_loss_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
+    # Also log separate losses
+    if args.loss == "combined": 
+        log_ce_sep_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
+        log_dice_sep_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
+        log_ce_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
+        log_dice_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
+
     best_dice: float = 0
+
+    # For organizing the logs/metrics during training/validation
+    (args.dest / "losses").mkdir(parents=True, exist_ok=True)
+    (args.dest / "metrics").mkdir(parents=True, exist_ok=True)
 
     for e in range(args.epochs):
         for m in ['train', 'val']:
@@ -245,6 +257,9 @@ def runTraining(args):
                     loader = train_loader
                     log_loss = log_loss_tra
                     log_dice = log_dice_tra
+                    if args.loss == "combined": # Also log separate losses
+                        log_ce_sep = log_ce_sep_tra
+                        log_dice_sep = log_dice_sep_tra
                 case 'val':
                     net.eval()
                     opt = None
@@ -253,6 +268,9 @@ def runTraining(args):
                     loader = val_loader
                     log_loss = log_loss_val
                     log_dice = log_dice_val
+                    if args.loss == "combined":
+                        log_ce_sep = log_ce_sep_val
+                        log_dice_sep = log_dice_sep_val
 
             with cm():  # Either dummy context manager, or the torch.no_grad for validation
                 j = 0
@@ -278,6 +296,10 @@ def runTraining(args):
                     loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
 
+                    if args.loss == "combined":
+                        log_ce_sep[e, i] = getattr(loss_fn, "last_ce", 0.0)
+                        log_dice_sep[e, i] = getattr(loss_fn, "last_dice", 0.0)
+
                     if opt:  # Only for training
                         loss.backward()
                         opt.step()
@@ -295,17 +317,26 @@ def runTraining(args):
                     # For the DSC average: do not take the background class (0) into account:
                     postfix_dict: dict[str, str] = {"Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
                                                     "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"}
+                    if args.loss == "combined":
+                        postfix_dict["CE"] = f"{log_ce_sep[e, :i + 1].mean():5.2e}"
+                        postfix_dict["Dice_loss"] = f"{log_dice_sep[e, :i + 1].mean():5.2e}"
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
-                                 
+
                     tq_iter.set_postfix(postfix_dict)
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
-        np.save(args.dest / "loss_tra.npy", log_loss_tra)
-        np.save(args.dest / "dice_tra.npy", log_dice_tra)
-        np.save(args.dest / "loss_val.npy", log_loss_val)
-        np.save(args.dest / "dice_val.npy", log_dice_val)
+        np.save(args.dest / "losses/loss_tra.npy", log_loss_tra)   # Can be CE or combined
+        np.save(args.dest / "metrics/dice_tra.npy", log_dice_tra)  # Hard dice -> metric only
+        np.save(args.dest / "losses/loss_val.npy", log_loss_val)
+        np.save(args.dest / "metrics/dice_val.npy", log_dice_val)
+
+        if args.loss == "combined":
+            np.save(args.dest / "losses/ce_loss_tra.npy", log_ce_sep_tra)
+            np.save(args.dest / "losses/dice_loss_tra.npy", log_dice_sep_tra)  # Soft dice (allows gradient)
+            np.save(args.dest / "losses/ce_loss_val.npy", log_ce_sep_val)
+            np.save(args.dest / "losses/dice_loss_val.npy", log_dice_sep_val)
 
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
 
