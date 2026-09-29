@@ -214,10 +214,12 @@ def runTraining(args):
     else:
         raise ValueError(args.mode, args.dataset)
 
+    ce_weight = torch.tensor(args.ce_weight, device=device) if args.ce_weight is not None else None
+
     if args.loss == "ce":
-        loss_fn = CrossEntropy(idk=idk)
+        loss_fn = CrossEntropy(idk=idk, weight=ce_weight)
     elif args.loss == "combined":
-        loss_fn = CombinedLoss(idk=idk, alpha=args.dice_alpha, generalized=args.generalized_dice)
+        loss_fn = CombinedLoss(idk=idk, alpha=args.dice_alpha, generalized=args.generalized_dice, weight=ce_weight)
     else:
         raise ValueError(args.loss)
 
@@ -430,7 +432,8 @@ def parse_args(argv=None):
                         help="Weight of CE vs Dice for combined loss")
     parser.add_argument('--generalized-dice', '--generalized_dice', action='store_true',
                         help="Use GeneralizedDiceLoss instead of DiceLoss")
-
+    parser.add_argument('--ce-weight', '--ce_weight', type=float, nargs='+', default=None,
+                        help="Optional class weights for CE, one float per class (add nr with spacing, no list)")
     parser.add_argument('--bspline_slices', action='store_true',
                      help="Reconstruct validation using the B-spline grid. Automatic for datasets containing 'bspline'.")
     parser.add_argument('--calculate-val-3d-hd', '--calculate_val_3d_hd', action='store_true',
@@ -493,6 +496,8 @@ def parse_args(argv=None):
         parser.error('--patience must be at least 1.')
     if not 0 <= args.dice_alpha <= 1:
         parser.error('--dice-alpha must be between 0 and 1.')
+    if args.ce_weight is not None and len(args.ce_weight) != params['K']:
+        parser.error(f"--ce-weight needs {params['K']} weight values")
     if args.batch_size < 1:
         parser.error('--batch-size must be at least 1.')
     if args.num_workers < 0:
