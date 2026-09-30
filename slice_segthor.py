@@ -40,7 +40,8 @@ from utils import map_, tqdm_
 import nibabel.processing as nibproc
 
 from PIL import Image
-from elasticdeform import deform_random_grid, deform_grid
+from elasticdeform import deform_grid
+import zlib
 
 def compute_train_data_HU_stats(source_path: Path, ids: list[str], clip: bool = False) -> dict[str, float]:
     """
@@ -255,19 +256,27 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
     # Saved slices are transposed then resized recording (row, column, z) in mm
     return dy * y / shape[0], dx * x / shape[1], dz
 
+def stable_seed(*parts) -> int:
+    return zlib.crc32("|".join(map(str, parts)).encode()) % (2**32)
+
 def generate_augmented_copies(id_: str, dest_path: Path, source_path: Path, shape: tuple[int, int], test_mode: bool = False,
                                clip: bool = False, norm="minmax", norm_scope="train_dataset",
                                train_dataset_stats: dict | None = None,
                                bspline: bool = False, new_spacing: tuple[float, float, float] = (1.0, 1.0, 1.0),
                                noise_p: float = 0.0, elastic_p: float = 0.0,
-                               elastic_sigma: float = 2.0, elastic_points: int = 2) -> None:
-
-    apply_noise = random.random() < noise_p
-    apply_elastic = random.random() < elastic_p
+                               elastic_sigma: float = 2.0, elastic_points: int = 2,
+                               base_seed: int = 0) -> None:
+    # Seed depends on base_seed and patient_id
+    sel_rng = np.random.default_rng(stable_seed(base_seed, id_, "select"))
+    apply_noise = sel_rng.random() < noise_p
+    apply_elastic = sel_rng.random() < elastic_p
 
     if not apply_noise and not apply_elastic:
-        return  # nothing to do for this copy — no file written
+        return  # nothing to do for this copy and no file written
     
+    elastic_rng = np.random.default_rng(stable_seed(base_seed, id_, "elastic"))
+    noise_rng   = np.random.default_rng(stable_seed(base_seed, id_, "noise"))
+
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
     ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
@@ -314,7 +323,7 @@ def generate_augmented_copies(id_: str, dest_path: Path, source_path: Path, shap
     # ELASTIC DEFORMATION to CT + GT
     if apply_elastic:
         # Build the random displacement field ourselves, so we can zero out the z-axis
-        displacement = np.random.randn(3, elastic_points, elastic_points, elastic_points) * elastic_sigma
+        displacement = elastic_rng.standard_normal((3, elastic_points, elastic_points, elastic_points)) * elastic_sigma
 
         # Axis order here matches axis=(0,1,2)=(x, y, z); zero out z (index 2)
         # since z-resolution is coarse/anisotropic relative to x/y
@@ -349,9 +358,9 @@ def generate_augmented_copies(id_: str, dest_path: Path, source_path: Path, shap
 
     # GAUSSIAN NOISE — applied after normalization, on the already-normalized volume
     if apply_noise:
-        variance = np.random.uniform(0, 0.1)
+        variance = noise_rng.uniform(0, 0.1)
         sigma = np.sqrt(variance)
-        noise = np.random.normal(0, sigma, norm_ct.shape)
+        noise = noise_rng.normal(0, sigma, norm_ct.shape)
         norm_ct = (norm_ct + noise).astype(np.float32)
 
     # Build a filename tag reflecting which augmentations were actually applied
@@ -479,23 +488,41 @@ def main(args: argparse.Namespace):
     if args.augment_noise or args.elastic:
         print(f"Generating augmented copies (noise_p={args.noise_p if args.augment_noise else 0}, "
           f"elastic_p={args.elastic_p if args.elastic else 0})...")
-    for id_ in training_ids:
-        generate_augmented_copies(
-            id_=id_,
-            dest_path=dest_path / "train",
-            source_path=src_path,
-            shape=tuple(args.shape),
-            clip=args.clip,
-            norm=args.norm,
-            norm_scope=args.norm_scope,
-            train_dataset_stats=datasets_stats,
-            bspline=args.bspline,
-            new_spacing=tuple(args.new_spacing),
-            noise_p=args.noise_p if args.augment_noise else 0.0,
-            elastic_p=args.elastic_p if args.elastic else 0.0,
-            elastic_sigma=args.elastic_sigma,
-            elastic_points=args.elastic_points,
-        )
+    # for id_ in training_ids:
+    #     generate_augmented_copies(
+    #         id_=id_,
+    #         dest_path=dest_path / "train",
+    #         source_path=src_path,
+    #         shape=tuple(args.shape),
+    #         clip=args.clip,
+    #         norm=args.norm,
+    #         norm_scope=args.norm_scope,
+    #         train_dataset_stats=datasets_stats,
+    #         bspline=args.bspline,
+    #         new_spacing=tuple(args.new_spacing),
+    #         noise_p=args.noise_p if args.augment_noise else 0.0,
+    #         elastic_p=args.elastic_p if args.elastic else 0.0,
+    #         elastic_sigma=args.elastic_sigma,
+    #         elastic_points=args.elastic_points,
+    #     )
+        pfun = partial(generate_augmented_copies,
+                    dest_path=dest_path / "train",
+                    source_path=src_path,
+                    shape=tuple(args.shape),
+                    clip=args.clip,
+                    norm=args.norm,
+                    norm_scope=args.norm_scope,
+                    train_dataset_stats=datasets_stats,
+                    bspline=args.bspline,
+                    new_spacing=tuple(args.new_spacing),
+                    noise_p=args.noise_p if args.augment_noise else 0.0,
+                    elastic_p=args.elastic_p if args.elastic else 0.0,
+                    elastic_sigma=args.elastic_sigma,
+                    elastic_points=args.elastic_points,
+                    base_seed=args.seed)
+
+        with Pool(args.process) as pool:
+            list(tqdm_(pool.imap(pfun, training_ids), total=len(training_ids)))
 
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Slicing parameters')
@@ -521,8 +548,6 @@ def get_args() -> argparse.Namespace:
                     help="Explicit list of patient IDs to use for validation")
     parser.add_argument('--augment_noise', action='store_true',
                  help="Generate offline noise-augmented copies of training slices after slicing.")
-    parser.add_argument('--n_noise_copies', type=int, default=2,
-                    help="Number of noisy copies to generate per training slice.")
     parser.add_argument('--noise_p', type=float, default=0.15,
                     help="Probability of applying noise to each copy.")
     parser.add_argument('--elastic', action='store_true',
