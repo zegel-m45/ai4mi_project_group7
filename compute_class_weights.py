@@ -27,8 +27,6 @@ def class_weights_from_counts(counts: torch.Tensor, weighting_method: str) -> to
 
     if weighting_method == "inverse":
         weights = 1.0 / freq
-    elif weighting_method == "median":
-        weights = freq.median() / freq
     # From Enet paper and this article: a custom Enet class weighting formula 
     # https://medium.com/data-science/enet-a-deep-neural-architecture-for-real-time-semantic-segmentation-2baa59cf97e9
     elif weighting_method == "enet":
@@ -44,7 +42,7 @@ def parse_args():
             formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument('--dataset', required=True, help="Dataset folder name")
     parser.add_argument('--subset', default='train', choices=['train', 'val'])
-    parser.add_argument('--weighting_method', default='median', choices=['inverse', 'median', 'enet'])
+    parser.add_argument('--weighting_method', default='inverse', choices=['inverse', 'enet'])
     return parser.parse_args()
 
 
