@@ -225,11 +225,12 @@ def evaluate_dice_and_hd_in_3d(args):
             false_negatives[patient_index, k] = gt_present and not pred_present
 
             if not pred_present and not gt_present: # Never triggers unless there is a mistake in the ground truth, since all patients should have all four organs in 3D.
+                dice_values[patient_index, k] = 1.0
                 if dice_only:
-                    print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN.") 
+                    print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=1.0.") 
                     continue
                 hd_values[patient_index, k] = 0
-                print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN, HD={hd_values[patient_index, k]}.")
+                print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=1.0, HD={hd_values[patient_index, k]}.")
                 continue
 
             # Add batch and channel dimensions for MONAI
