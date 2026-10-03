@@ -224,9 +224,9 @@ def evaluate_dice_and_hd_in_3d(args):
             false_positives[patient_index, k] = pred_present and not gt_present
             false_negatives[patient_index, k] = gt_present and not pred_present
 
-            if not pred_present and not gt_present:
+            if not pred_present and not gt_present: # Never triggers unless there is a mistake in the ground truth, since all patients should have all four organs in 3D.
                 if dice_only:
-                    print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN.")
+                    print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN.") 
                     continue
                 hd_values[patient_index, k] = 0
                 print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=NaN, HD={hd_values[patient_index, k]}.")
