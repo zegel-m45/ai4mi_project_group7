@@ -111,7 +111,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = args.kernels
     factor: int = args.factor
-    net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+    in_dim = args.context_slices
+    net = datasets_params[args.dataset]['net'](in_dim, K, kernels=kernels, factor=factor)
     net.init_weights()
     net.to(device)
 
@@ -177,7 +178,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              root_dir,
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
-                             debug=args.debug, exclude=exclude_set) #added
+                             debug=args.debug, exclude=exclude_set,
+ 	                         context_slices=args.context_slices) #added
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=args.num_workers,
@@ -188,7 +190,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            root_dir,
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
-                           debug=args.debug, exclude=exclude_set) #added
+                           debug=args.debug, exclude=exclude_set,
+                           context_slices=args.context_slices) #added
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=args.num_workers,
@@ -283,7 +286,11 @@ def runTraining(args):
 
                     # Sanity tests to see we loaded and encoded the data correctly
                     assert torch.isfinite(img).all(), "Input contains non-finite intensities" # images produced by z-scoring are no longer 0 to 1
-                    B, _, W, H = img.shape
+                    B, C, W, H = img.shape
+
+                    assert C == args.context_slices, (
+ 	                        f"Expected {args.context_slices} input channels, got {C} instead."
+ 	                )
 
                     pred_logits = net(img)
                     pred_probs = F.softmax(args.logit_scale * pred_logits, dim=1)
@@ -469,6 +476,8 @@ def parse_args(argv=None):
     parser.add_argument('--logit-scale', '--logit_scale', type=float, default=1.0,
                         help="Positive multiplier applied to logits before softmax "
                              "during training and validation (inverse temperature).")
+    parser.add_argument('--context-slices', type=int, default=1,
+ 	                        help="Number of total context slices for 2.5D, default=1 is 2D")
     args = parser.parse_args(argv)
 
     if args.debug and args.dataset != 'TOY2':
@@ -511,6 +520,9 @@ def parse_args(argv=None):
     if not math.isfinite(args.logit_scale) or args.logit_scale <= 0:
         parser.error('--logit-scale must be finite and greater than 0.')
 
+    if args.context_slices < 1 or args.context_slices % 2 == 0:
+        parser.error('--context-slices must be a positive odd integer, e.g. 3 or 5.')
+             
     return args
 
 
