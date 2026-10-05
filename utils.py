@@ -34,6 +34,7 @@ from PIL import Image
 from tqdm import tqdm
 from torch import Tensor, einsum
 from monai.metrics import compute_hausdorff_distance
+from scipy.ndimage import distance_transform_edt as eucl_distance
 
 tqdm_ = partial(tqdm, dynamic_ncols=True,
                 leave=True,
@@ -121,6 +122,25 @@ def probs2one_hot(probs: Tensor) -> Tensor:
     res = class2one_hot(probs2class(probs), K)
     assert res.shape == probs.shape
     assert one_hot(res)
+
+    return res
+
+# Copied from: https://github.com/LIVIAETS/boundary-loss
+def one_hot2dist(seg: np.ndarray, resolution: Tuple[float, float, float] = None,
+                 dtype=None) -> np.ndarray:
+    assert one_hot(torch.tensor(seg), axis=0)
+    K: int = len(seg)
+
+    res = np.zeros_like(seg, dtype=dtype)
+    for k in range(K):
+        posmask = seg[k].astype(bool)
+
+        if posmask.any():
+            negmask = ~posmask
+            res[k] = eucl_distance(negmask, sampling=resolution) * negmask \
+                - (eucl_distance(posmask, sampling=resolution) - 1) * posmask
+        # The idea is to leave blank the negative classes
+        # since this is one-hot encoded, another class will supervise that pixel
 
     return res
 

@@ -32,6 +32,8 @@ from PIL import Image
 import numpy as np # added for npy images produced by z-scoring
 from torch.utils.data import Dataset
 
+from utils import one_hot2dist
+
 # ERROR FIX
 def gt_stem_for(image_stem: str) -> str:
     """
@@ -46,12 +48,14 @@ def gt_stem_for(image_stem: str) -> str:
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
                  gt_transform=None, augment=False, equalize=False, debug=False, 
-                 exclude: set[str] | None = None, context_slices: int = 1):
+                 exclude: set[str] | None = None, context_slices: int = 1,
+                 dist_maps: bool = False):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
         self.augmentation: bool = augment
         self.equalize: bool = equalize
+        self.dist_maps: bool = dist_maps # also return signed distance maps of the GT (for the boundary loss)
 
         self.test_mode: bool = subset == 'test'
 
@@ -222,5 +226,8 @@ class SliceDataset(Dataset):
             )
 
             data_dict["gts"] = gt
+
+            if self.dist_maps:
+                data_dict["dist_maps"] = torch.from_numpy(one_hot2dist(gt.numpy(), dtype=np.float32))
 
         return data_dict

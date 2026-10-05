@@ -23,14 +23,22 @@
 # SOFTWARE.
 
 
-from torch import einsum
+from typing import Any, Callable, List, Tuple
+import numpy as np
+import torch
+from scipy.ndimage import distance_transform_edt as eucl_distance
+from torch import Tensor, einsum
 from monai.losses import DiceLoss, GeneralizedDiceLoss
-from utils import simplex, sset
+from utils import simplex, sset, one_hot
 
 class CombinedLoss():
-    def __init__(self, idk, alpha=0.5, generalized=False, weight=None):
+    def __init__(self, idk, alpha=0.5, generalized=False, weight=None, boundary_weight=0.0):
         self.idk = idk
         self.alpha = alpha # scalar for which loss gets more weight
+        # [weight of the CE/Dice loss combi, weight of the boundary loss term] at the start 
+        # (StealWeight will gradually change it after each epoch)
+        self.weights = [1.0, boundary_weight]
+        self.boundary = SurfaceLoss(idc=idk) if boundary_weight > 0 else None
         self.ce = CrossEntropy(idk=idk, weight=weight)
         dice_loss = GeneralizedDiceLoss if generalized else DiceLoss
         # In main.py we already apply F.softmax (so therefore False here)
@@ -43,10 +51,12 @@ class CombinedLoss():
         # For logging
         self.last_ce = 0.0
         self.last_dice = 0.0
+        self.last_boundary = 0.0
 
-        print(f"Initialized {self.__class__.__name__} with idk={idk}, alpha={alpha}, generalized={generalized}")
+        print(f"Initialized {self.__class__.__name__} with idk={idk}, alpha={alpha}, generalized={generalized}, "
+              f"boundary_weight={boundary_weight}")
 
-    def __call__(self, pred_softmax, weak_target):
+    def __call__(self, pred_softmax, weak_target, dist_maps=None):
         assert pred_softmax.shape == weak_target.shape
         assert simplex(pred_softmax)
         assert sset(weak_target, [0, 1])
@@ -60,7 +70,52 @@ class CombinedLoss():
         self.last_ce = ce_loss.item()
         self.last_dice = dice_loss.item()
 
-        return self.alpha * ce_loss + (1 - self.alpha) * dice_loss
+        loss = self.weights[0] * (self.alpha * ce_loss + (1 - self.alpha) * dice_loss)
+
+        if self.boundary is not None:
+            assert dist_maps is not None, "boundary_weight > 0 needs the distance maps of the ground truth"
+            boundary_loss = self.boundary(pred_softmax, dist_maps)
+            self.last_boundary = boundary_loss.item()
+            loss = loss + self.weights[1] * boundary_loss
+
+        return loss
+
+
+# Copied from: https://github.com/LIVIAETS/boundary-loss (scheduler.py)
+class StealWeight():
+    def __init__(self, to_steal: float):
+        self.to_steal: float = to_steal
+
+    def __call__(self, epoch: int, optimizer: Any, loss_fns: list[list[Callable]], loss_weights: list[list[float]]) \
+            -> Tuple[float, list[list[Callable]], list[list[float]]]:
+        new_weights: list[list[float]] = [[max(0.1, a - self.to_steal), b + self.to_steal] for a, b in loss_weights]
+
+        print(f"Loss weights went from {loss_weights} to {new_weights}")
+
+        return optimizer, loss_fns, new_weights
+
+
+# Copied from: https://github.com/LIVIAETS/boundary-loss
+class SurfaceLoss():
+    def __init__(self, **kwargs):
+        # Self.idc is used to filter out some classes of the target mask. Use fancy indexing
+        self.idc: List[int] = kwargs["idc"]
+        print(f"Initialized {self.__class__.__name__} with {kwargs}")
+
+    def __call__(self, probs: Tensor, dist_maps: Tensor) -> Tensor:
+        assert simplex(probs)
+        assert not one_hot(dist_maps)
+
+        pc = probs[:, self.idc, ...].type(torch.float32)
+        dc = dist_maps[:, self.idc, ...].type(torch.float32)
+
+        multipled = einsum("bkwh,bkwh->bkwh", pc, dc)
+
+        loss = multipled.mean()
+
+        return loss
+
+
 
 
 class CrossEntropy():

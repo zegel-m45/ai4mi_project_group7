@@ -52,7 +52,7 @@ from utils import (Dcm,
                    dice_coef,
                    save_images)
 
-from losses import (CrossEntropy, CombinedLoss)
+from losses import (CrossEntropy, CombinedLoss, StealWeight)
 import random
 from stitch import main as stitch_predictions
 from evaluate_metrics_offline import evaluate_dice_and_hd_in_3d
@@ -179,7 +179,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
                              debug=args.debug, exclude=exclude_set,
- 	                         context_slices=args.context_slices) #added
+ 	                         context_slices=args.context_slices, #added
+                             dist_maps=args.boundary_weight > 0)
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=args.num_workers,
@@ -191,7 +192,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
                            debug=args.debug, exclude=exclude_set,
-                           context_slices=args.context_slices) #added
+                           context_slices=args.context_slices, #added
+                           dist_maps=args.boundary_weight > 0)
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=args.num_workers,
@@ -222,7 +224,8 @@ def runTraining(args):
     if args.loss == "ce":
         loss_fn = CrossEntropy(idk=idk, weight=ce_weight)
     elif args.loss == "combined":
-        loss_fn = CombinedLoss(idk=idk, alpha=args.dice_alpha, generalized=args.generalized_dice, weight=ce_weight)
+        loss_fn = CombinedLoss(idk=idk, alpha=args.dice_alpha, generalized=args.generalized_dice, weight=ce_weight,
+                            boundary_weight=args.boundary_weight)
     else:
         raise ValueError(args.loss)
 
@@ -235,11 +238,15 @@ def runTraining(args):
     log_dice_val: Tensor = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
     # Also log separate losses
+    use_boundary = args.loss == "combined" and args.boundary_weight > 0
     if args.loss == "combined": 
         log_ce_sep_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
         log_dice_sep_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
         log_ce_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
         log_dice_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
+    if use_boundary:
+        log_bnd_sep_tra: Tensor = torch.zeros((args.epochs, len(train_loader)))
+        log_bnd_sep_val: Tensor = torch.zeros((args.epochs, len(val_loader)))
 
     best_dice: float = float('-inf')
     patience: int = args.patience
@@ -262,6 +269,8 @@ def runTraining(args):
                     if args.loss == "combined": # Also log separate losses
                         log_ce_sep = log_ce_sep_tra
                         log_dice_sep = log_dice_sep_tra
+                    if use_boundary:
+                        log_bnd_sep = log_bnd_sep_tra
                 case 'val':
                     net.eval()
                     opt = None
@@ -273,6 +282,8 @@ def runTraining(args):
                     if args.loss == "combined":
                         log_ce_sep = log_ce_sep_val
                         log_dice_sep = log_dice_sep_val
+                    if use_boundary:
+                        log_bnd_sep = log_bnd_sep_val
 
             with cm():  # Either dummy context manager, or the torch.no_grad for validation
                 j = 0
@@ -299,12 +310,17 @@ def runTraining(args):
                     pred_seg = probs2one_hot(pred_probs)
                     log_dice[e, j:j + B, :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
                     
-                    loss = loss_fn(pred_probs, gt)
+                    if use_boundary:
+                        loss = loss_fn(pred_probs, gt, data['dist_maps'].to(device))
+                    else:
+                        loss = loss_fn(pred_probs, gt)
                     log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
 
                     if args.loss == "combined":
                         log_ce_sep[e, i] = getattr(loss_fn, "last_ce", 0.0)
                         log_dice_sep[e, i] = getattr(loss_fn, "last_dice", 0.0)
+                    if use_boundary:
+                        log_bnd_sep[e, i] = getattr(loss_fn, "last_boundary", 0.0)
 
                     if opt:  # Only for training
                         loss.backward()
@@ -326,11 +342,17 @@ def runTraining(args):
                     if args.loss == "combined":
                         postfix_dict["CE"] = f"{log_ce_sep[e, :i + 1].mean():5.2e}"
                         postfix_dict["Dice_loss"] = f"{log_dice_sep[e, :i + 1].mean():5.2e}"
+                        if use_boundary:
+                            postfix_dict["Boundary"] = f"{log_bnd_sep[e, :i + 1].mean():5.2e}"
                     if K > 2:
                         postfix_dict |= {f"Dice-{k}": f"{log_dice[e, :j, k].mean():05.3f}"
                                          for k in range(1, K)}
 
                     tq_iter.set_postfix(postfix_dict)
+
+        if args.boundary_steal > 0:  # Shift weight from the region loss to the boundary loss after each epoch
+            _, _, new_weights = StealWeight(args.boundary_steal)(e, optimizer, [loss_fn], [loss_fn.weights])
+            loss_fn.weights = new_weights[0]
 
         # I save it at each epochs, in case the code crashes or I decide to stop it early
         np.save(args.dest / "loss_tra.npy", log_loss_tra[:e + 1]) # Can be CE or combined
@@ -343,6 +365,9 @@ def runTraining(args):
             np.save(args.dest / "losses/dice_loss_tra.npy", log_dice_sep_tra[:e + 1])  # Soft dice (allows gradient)
             np.save(args.dest / "losses/ce_loss_val.npy", log_ce_sep_val[:e + 1])
             np.save(args.dest / "losses/dice_loss_val.npy", log_dice_sep_val[:e + 1])
+            if use_boundary:
+                np.save(args.dest / "losses/boundary_loss_tra.npy", log_bnd_sep_tra[:e + 1])
+                np.save(args.dest / "losses/boundary_loss_val.npy", log_bnd_sep_val[:e + 1])
         
         current_dice: float = log_dice_val[e, :, 1:].mean().item()
 
@@ -439,6 +464,11 @@ def parse_args(argv=None):
                         help="Weight of CE vs Dice for combined loss")
     parser.add_argument('--generalized-dice', '--generalized_dice', action='store_true',
                         help="Use GeneralizedDiceLoss instead of DiceLoss")
+    parser.add_argument('--boundary-weight', '--boundary_weight', type=float, default=0.0,
+                        help="Weight of the boundary loss added to the combined loss. 0 disables it.")
+    parser.add_argument('--boundary-steal', '--boundary_steal', type=float, default=0.0,
+                        help="Per epoch, move this much weight from the CE/Dice loss to the boundary loss "
+                             "(StealWeight of the boundary-loss repo, region weight floored at 0.1). 0 disables it.")
     parser.add_argument('--ce-weight', '--ce_weight', type=float, nargs='+', default=None,
                         help="Optional class weights for CE, one float per class (add nr with spacing, no list)")
     parser.add_argument('--bspline_slices', action='store_true',
@@ -505,6 +535,14 @@ def parse_args(argv=None):
         parser.error('--patience must be at least 1.')
     if not 0 <= args.dice_alpha <= 1:
         parser.error('--dice-alpha must be between 0 and 1.')
+    if args.boundary_weight < 0:
+        parser.error('--boundary-weight must be non-negative.')
+    if args.boundary_steal < 0:
+        parser.error('--boundary-steal must be non-negative.')
+    if args.boundary_steal > 0 and args.boundary_weight <= 0:
+        parser.error('--boundary-steal requires --boundary-weight > 0 (the initial boundary weight).')
+    if args.boundary_weight > 0 and args.loss != 'combined':
+        parser.error('--boundary-weight requires --loss combined.')
     if args.ce_weight is not None and len(args.ce_weight) != params['K']:
         parser.error(f"--ce-weight needs {params['K']} weight values")
     if args.batch_size < 1:
