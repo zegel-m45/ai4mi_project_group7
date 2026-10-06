@@ -209,9 +209,18 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     return (net, optimizer, device, train_loader, val_loader, K)
 
 
+def make_lr_scheduler(args, optimizer):
+    if args.lr_scheduler == "none":
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=args.lr_factor, patience=args.lr_patience,
+        threshold=args.lr_threshold, threshold_mode="abs", min_lr=args.min_lr)
+
+
 def runTraining(args):
     print(f">>> Setting up to train on {args.dataset} with {args.mode}")
     net, optimizer, device, train_loader, val_loader, K = setup(args)
+    scheduler = make_lr_scheduler(args, optimizer)
     use_3d = (args.dataset != 'TOY2')
     log_dice_3d, log_hd_3d = [], []
     validation_patients = None
@@ -402,6 +411,14 @@ def runTraining(args):
             if not any((epoch_folder / 'val').iterdir()):
                 (epoch_folder / 'val').rmdir()
 
+        # Use the same validation metric as checkpoint selection, once per epoch.
+        if scheduler is not None:
+            old_lr = optimizer.param_groups[0]["lr"]
+            scheduler.step(current_dice)
+            new_lr = optimizer.param_groups[0]["lr"]
+            if new_lr < old_lr:
+                print(f">>> Learning rate at epoch {e}: {old_lr:.3g}->{new_lr:.3g}")
+
         patience -= 1
         
         if current_dice > best_dice:
@@ -493,13 +510,23 @@ def parse_args(argv=None):
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
                         help="Optimizer to use for training.")
     parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
-                        help="Adam learning rate.")
+                        help="Initial optimizer learning rate.")
     parser.add_argument('--beta1', type=float, default=0.9,
                         help="Adam beta for the running average of gradients.")
     parser.add_argument('--beta2', type=float, default=0.999,
                         help="Adam beta for the running average of squared gradients.")
     parser.add_argument('--weight-decay', '--weight_decay', type=float, default=0.0,
                         help="Weight decay for optimizer.")
+    parser.add_argument('--lr-scheduler', choices=['none', 'plateau'], default='none',
+                        help="Optional learning-rate schedule based on validation Dice.")
+    parser.add_argument('--lr-factor', type=float, default=0.5,
+                        help="Multiply the learning rate by this factor on a plateau.")
+    parser.add_argument('--lr-patience', type=int, default=3,
+                        help="Plateau patience; reduce after this many + 1 stalled validation checks.")
+    parser.add_argument('--lr-threshold', type=float, default=1e-4,
+                        help="Minimum absolute Dice gain for the scheduler; checkpoint selection is unchanged.")
+    parser.add_argument('--min-lr', type=float, default=1e-6,
+                        help="Minimum learning rate for the plateau scheduler.")
     parser.add_argument('--batch-size', '--batch_size', type=int, default=None,
                         help="Batch size for training and validation; None uses the dataset default "
                              "(TOY2: 2, SEGTHOR variants: 8).")
@@ -563,6 +590,19 @@ def parse_args(argv=None):
         parser.error('--beta1 and --beta2 must each be in [0, 1).')
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error('--weight-decay must be finite and non-negative.')
+    if not math.isfinite(args.lr_factor) or not 0 < args.lr_factor < 1:
+        parser.error('--lr-factor must be finite and between 0 and 1 (exclusive).')
+    if args.lr_patience < 0:
+        parser.error('--lr-patience must be non-negative.')
+    if not math.isfinite(args.lr_threshold) or args.lr_threshold < 0:
+        parser.error('--lr-threshold must be finite and non-negative.')
+    if not math.isfinite(args.min_lr) or args.min_lr < 0:
+        parser.error('--min-lr must be finite and non-negative.')
+    if args.lr_scheduler == 'plateau':
+        if args.lr <= 0 or args.min_lr >= args.lr:
+            parser.error('--min-lr must be below a positive --lr when using the plateau scheduler.')
+        if args.lr_patience + 1 >= args.patience:
+            parser.error('--lr-patience + 1 must be below --patience to allow training after an LR reduction.')
     if args.kernels < 2 or not (1 <= args.factor <= args.kernels):
         parser.error('--kernels must be at least 2 and --factor must be between 1 and --kernels.')
     if not math.isfinite(args.logit_scale) or args.logit_scale <= 0:
