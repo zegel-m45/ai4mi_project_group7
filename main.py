@@ -119,6 +119,9 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     if args.optimizer.lower() == "adamw":
         optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
                                       betas=(args.beta1, args.beta2))
+    elif args.optimizer.lower() == "sgd":
+        optimizer = torch.optim.SGD(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                                    momentum=args.momentum, nesterov=args.nesterov)
     else:
         optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
                                      betas=(args.beta1, args.beta2))
@@ -507,7 +510,7 @@ def parse_args(argv=None):
                         help='Spacing used when preprocessing B-spline datasets.')
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument('--patience', type=int, default=10, help="Patience for early stopping.")
-    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'sgd'],
                         help="Optimizer to use for training.")
     parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
                         help="Initial optimizer learning rate.")
@@ -517,6 +520,10 @@ def parse_args(argv=None):
                         help="Adam beta for the running average of squared gradients.")
     parser.add_argument('--weight-decay', '--weight_decay', type=float, default=0.0,
                         help="Weight decay for optimizer.")
+    parser.add_argument('--momentum', type=float, default=0.9,
+                        help="Momentum for SGD; 0 disables momentum. Ignored by Adam/AdamW.")
+    parser.add_argument('--nesterov', action='store_true',
+                        help="Enable Nesterov momentum for SGD; requires positive --momentum.")
     parser.add_argument('--lr-scheduler', choices=['none', 'plateau'], default='none',
                         help="Optional learning-rate schedule based on validation Dice.")
     parser.add_argument('--lr-factor', type=float, default=0.5,
@@ -590,6 +597,12 @@ def parse_args(argv=None):
         parser.error('--beta1 and --beta2 must each be in [0, 1).')
     if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
         parser.error('--weight-decay must be finite and non-negative.')
+    if not math.isfinite(args.momentum) or args.momentum < 0:
+        parser.error('--momentum must be finite and non-negative.')
+    if args.nesterov and args.optimizer != 'sgd':
+        parser.error('--nesterov requires --optimizer sgd.')
+    if args.nesterov and args.momentum <= 0:
+        parser.error('--nesterov requires positive --momentum.')
     if not math.isfinite(args.lr_factor) or not 0 < args.lr_factor < 1:
         parser.error('--lr-factor must be finite and between 0 and 1 (exclusive).')
     if args.lr_patience < 0:
