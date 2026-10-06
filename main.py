@@ -116,8 +116,12 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     net.init_weights()
     net.to(device)
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=args.lr,
-                                 betas=(args.beta1, args.beta2))
+    if args.optimizer.lower() == "adamw":
+        optimizer = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                                      betas=(args.beta1, args.beta2))
+    else:
+        optimizer = torch.optim.Adam(net.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+                                     betas=(args.beta1, args.beta2))
 
     # Dataset part
     B: int = args.batch_size
@@ -486,12 +490,16 @@ def parse_args(argv=None):
                         help='Spacing used when preprocessing B-spline datasets.')
     parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
     parser.add_argument('--patience', type=int, default=10, help="Patience for early stopping.")
+    parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw'],
+                        help="Optimizer to use for training.")
     parser.add_argument('--lr', '--learning-rate', type=float, default=0.0005,
                         help="Adam learning rate.")
     parser.add_argument('--beta1', type=float, default=0.9,
                         help="Adam beta for the running average of gradients.")
     parser.add_argument('--beta2', type=float, default=0.999,
                         help="Adam beta for the running average of squared gradients.")
+    parser.add_argument('--weight-decay', '--weight_decay', type=float, default=0.0,
+                        help="Weight decay for optimizer.")
     parser.add_argument('--batch-size', '--batch_size', type=int, default=None,
                         help="Batch size for training and validation; None uses the dataset default "
                              "(TOY2: 2, SEGTHOR variants: 8).")
@@ -553,6 +561,8 @@ def parse_args(argv=None):
         parser.error('--lr must be finite and non-negative.')
     if not (0 <= args.beta1 < 1) or not (0 <= args.beta2 < 1):
         parser.error('--beta1 and --beta2 must each be in [0, 1).')
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error('--weight-decay must be finite and non-negative.')
     if args.kernels < 2 or not (1 <= args.factor <= args.kernels):
         parser.error('--kernels must be at least 2 and --factor must be between 1 and --kernels.')
     if not math.isfinite(args.logit_scale) or args.logit_scale <= 0:
