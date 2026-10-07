@@ -10,11 +10,10 @@ python evaluate_metrics_offline.py --dimensionality 3 --pred-dir volumes/YOUR_RU
   --output-dir results/YOUR_RUN/metrics_3d --percentile 95
 
 FP/FN are slice-class (2D) or patient-class (3D) presence errors, not pixel/voxel counts.
-HD is computed only when both masks contain the class.
-Add --include-penalty to assign the physical image diagonal to one-empty pairs.
-Both-empty pairs always get zero HD, regardless of the penalty flag.
+HD is computed only when both masks contain the class. Add --include-penalty to assign the physical image diagonal to one-empty pairs. Both-empty pairs always get zero HD, regardless of the penalty flag.
+NSD uses area-weighted subvoxel surfaces and --nsd-tolerance in mm (default 3).
 2D outputs have shape (slices, classes).
-3D outputs have shape (patients, classes).
+3D outputs have shape (patients, classes). 
 """
 
 import argparse
@@ -25,8 +24,7 @@ import numpy as np
 import nibabel as nib
 import torch
 from PIL import Image
-from monai.metrics import compute_hausdorff_distance
-from monai.metrics import compute_dice
+from monai.metrics import compute_hausdorff_distance, compute_dice, compute_surface_dice
 
 
 def metric_device(args):
@@ -161,8 +159,12 @@ def evaluate_hd_in_2d(args):
     print(f'Total slices: {len(files)}; foreground slice-class pairs: {len(files) * (args.classes - 1)}')
 
 
-def evaluate_dice_and_hd_in_3d(args):
+def evaluate_dice_hd_nsd_in_3d(args):
     dice_only = getattr(args, 'dice_only', False)
+    nsd_tolerance = getattr(args, 'nsd_tolerance', 3.0)
+    if not dice_only and (not np.isfinite(nsd_tolerance) or nsd_tolerance < 0):
+        raise ValueError('NSD tolerance must be finite and nonnegative (mm).')
+    
     device = metric_device(args)
     files = sorted(args.pred_dir.glob('*.nii.gz'))
     assert files, f'No stitched NIfTI files found in {args.pred_dir}'
@@ -170,7 +172,8 @@ def evaluate_dice_and_hd_in_3d(args):
     patient_names = []
     shape = (len(files), args.classes)
     dice_values = np.full(shape, np.nan, dtype=np.float32)
-    hd_values = np.full(shape, np.nan, dtype=np.float32)
+    nsd_values = np.full(shape, np.nan, dtype=np.float32) if not dice_only else None
+    hd_values = np.full(shape, np.nan, dtype=np.float32) if not dice_only else None
     false_positives = np.zeros(shape, dtype=bool)
     false_negatives = np.zeros(shape, dtype=bool)
 
@@ -230,6 +233,7 @@ def evaluate_dice_and_hd_in_3d(args):
                     print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=1.0.") 
                     continue
                 hd_values[patient_index, k] = 0
+                nsd_values[patient_index, k] = 1.0
                 print(f"Warning: Both masks empty for patient {patient}, class {k}. Dice=1.0, HD={hd_values[patient_index, k]}.")
                 continue
 
@@ -240,7 +244,7 @@ def evaluate_dice_and_hd_in_3d(args):
                 prediction_tensor,
                 target_tensor,
                 include_background=True,  # channel contains one organ
-                ignore_empty=False).item()
+                ignore_empty=False).item() # = 0 when one-empty pair
             
             dice_values[patient_index, k] = dice
             if dice_only:
@@ -256,16 +260,28 @@ def evaluate_dice_and_hd_in_3d(args):
                     directed=False,
                     distance_metric='euclidean',
                     spacing=spacing).item()
+                
+                nsd = compute_surface_dice(
+                    prediction_tensor, 
+                    target_tensor, 
+                    class_thresholds=[nsd_tolerance],
+                    include_background=True, # channel contains one organ
+                    spacing=spacing, 
+                    use_subvoxels=True).item()
            
                 hd_values[patient_index, k] = hd
+                nsd_values[patient_index, k] = nsd
             else: # optionally penalize a one-empty pair
                 hd_values[patient_index, k] = penalty
+                nsd_values[patient_index, k] = 0.0
 
     # Save results
     args.output_dir.mkdir(parents=True, exist_ok=True)
     np.save(args.output_dir / 'dice_3d_val.npy', dice_values)
     if not dice_only:
         np.save(args.output_dir / 'hd_3d_val.npy', hd_values)
+        np.save(args.output_dir / 'nsd_3d_val.npy', nsd_values)
+        np.save(args.output_dir / 'nsd_tolerance_mm.npy', nsd_tolerance)
     np.save(args.output_dir / 'fp_3d_val.npy', false_positives)
     np.save(args.output_dir / 'fn_3d_val.npy', false_negatives)
     np.save(args.output_dir / 'patients_val.npy', np.asarray(patient_names))
@@ -274,18 +290,24 @@ def evaluate_dice_and_hd_in_3d(args):
     for k in range(1, args.classes): # skip background
         valid_hd = []
         valid_dice = []
+        valid_nsd = []
         for patient_index in range(len(patient_names)):
-            hd = hd_values[patient_index, k]
+            hd = hd_values[patient_index, k] if not dice_only else np.nan
             dice = dice_values[patient_index, k]
+            nsd = nsd_values[patient_index, k] if not dice_only else np.nan
             if np.isfinite(hd):
                 valid_hd.append(hd)
             if np.isfinite(dice):
                 valid_dice.append(dice)
+            if np.isfinite(nsd):
+                valid_nsd.append(nsd)
 
         mean_hd = float('nan')
         mean_dice = float('nan')
         std_hd = float('nan')
         std_dice = float('nan')
+        mean_nsd = float('nan')
+        std_nsd = float('nan')
 
         if len(valid_hd) > 0:
             mean_hd = np.mean(valid_hd)
@@ -293,6 +315,9 @@ def evaluate_dice_and_hd_in_3d(args):
         if len(valid_dice) > 0:
             mean_dice = np.mean(valid_dice)
             std_dice = np.std(valid_dice)
+        if len(valid_nsd) > 0:
+            mean_nsd = np.mean(valid_nsd)
+            std_nsd = np.std(valid_nsd)
 
         total = len(patient_names)
         print(f'Class {k}: total patients={total}, '
@@ -302,9 +327,11 @@ def evaluate_dice_and_hd_in_3d(args):
         if not dice_only:
             print(f'  HD{args.percentile:g}: mean={mean_hd:.3f} mm, std={std_hd:.3f} mm, '
                   f'valid={len(valid_hd)}, invalid={total - len(valid_hd)}')
+            print(f'  NSD ({nsd_tolerance:g} mm): mean={mean_nsd:.3f}, std={std_nsd:.3f}, '
+                  f'valid={len(valid_nsd)}, invalid={total - len(valid_nsd)}')
 
 
-    return dice_values, hd_values, patient_names
+    return dice_values, hd_values, nsd_values, patient_names
 
 
 if __name__ == '__main__':
@@ -319,9 +346,11 @@ if __name__ == '__main__':
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--classes', type=int, default=5)
     parser.add_argument('--percentile', type=float, choices=[50, 90, 95, 100], default=95)
+    parser.add_argument('--nsd-tolerance', type=float, default=3.0,
+                        help='3D normalized surface Dice tolerance in mm (default: 3.0).')
     parser.add_argument('--dimensionality', type=int, choices=[2, 3], default=3)
     parser.add_argument('--dice-only', action='store_true',
-                        help='For 3D only: skip HD computation and saving, while keeping Dice, FP/FN and patient IDs')
+                        help='For 3D only: skip HD and NSD computation and saving, while keeping Dice, FP/FN and patient IDs')
     parser.add_argument('--include-penalty', action='store_true',
                         help='Use the physical diagonal for one-empty masks. The default leaves them as NaN.')
     parser.add_argument('--device', choices=['cpu', 'cuda', 'auto'], default='auto',
@@ -335,4 +364,4 @@ if __name__ == '__main__':
         assert args.spacing_file is not None, '--spacing-file is required for 2D evaluation'
         evaluate_hd_in_2d(args)
     elif args.dimensionality == 3:
-        evaluate_dice_and_hd_in_3d(args)
+        evaluate_dice_hd_nsd_in_3d(args)
