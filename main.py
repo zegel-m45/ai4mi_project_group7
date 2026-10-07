@@ -55,7 +55,7 @@ from utils import (Dcm,
 from losses import (CrossEntropy, CombinedLoss, StealWeight)
 import random
 from stitch import main as stitch_predictions
-from evaluate_metrics_offline import evaluate_dice_and_hd_in_3d
+from evaluate_metrics_offline import evaluate_dice_hd_nsd_in_3d
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -225,7 +225,7 @@ def runTraining(args):
     net, optimizer, device, train_loader, val_loader, K = setup(args)
     scheduler = make_lr_scheduler(args, optimizer)
     use_3d = (args.dataset != 'TOY2')
-    log_dice_3d, log_hd_3d = [], []
+    log_dice_3d, log_hd_3d, log_nsd_3d = [], [], []
     validation_patients = None
 
     if args.mode == "full":
@@ -389,7 +389,7 @@ def runTraining(args):
 
         if use_3d:
             epoch_folder = args.dest / f"iter{e:03d}"
-            dice_3d, hd_3d, patients = evaluate_validation_3d(args, epoch_folder, K)
+            dice_3d, hd_3d, nsd_3d, patients = evaluate_validation_3d(args, epoch_folder, K)
             
             if validation_patients is not None and patients != validation_patients:
                 raise ValueError('Validation patient order changed between epochs.')
@@ -397,9 +397,12 @@ def runTraining(args):
             log_dice_3d.append(dice_3d)
             np.save(args.dest / 'dice_3d_val.npy', np.asarray(log_dice_3d))
 
-            if args.calculate_val_3d_hd:
+            if args.calculate_val_3d_hd_nsd:
                 log_hd_3d.append(hd_3d)
                 np.save(args.dest / 'hd_3d_val.npy', np.asarray(log_hd_3d))
+                log_nsd_3d.append(nsd_3d)
+                np.save(args.dest / 'nsd_3d_val.npy', np.asarray(log_nsd_3d))
+                np.save(args.dest / 'nsd_tolerance_mm.npy', args.nsd_tolerance)
 
             np.save(args.dest / 'patients_val.npy', np.asarray(patients))
     
@@ -457,11 +460,12 @@ def evaluate_validation_3d(args, epoch_folder, classes):
         bspline=args.bspline_slices or "bspline" in args.dataset.lower(),
         new_spacing=args.new_spacing))
     
-    # Evaluate the 3D Dice and optionally the 3D Hausdorff distance
-    results = evaluate_dice_and_hd_in_3d(argparse.Namespace(
+    # Evaluate 3D Dice and optionally HD and normalized surface Dice
+    results = evaluate_dice_hd_nsd_in_3d(argparse.Namespace(
         pred_dir=volumes, gt_dir=args.gt_3d_dir, gt_pattern=args.gt_3d_pattern,
         output_dir=epoch_folder / 'metrics_3d', classes=classes,
-        dice_only=not args.calculate_val_3d_hd, percentile=args.hd_percentile,
+        dice_only=not args.calculate_val_3d_hd_nsd, percentile=args.hd_percentile,
+        nsd_tolerance=args.nsd_tolerance,
         device='cuda' if args.gpu and torch.cuda.is_available() else 'cpu',
         include_penalty=args.include_penalty))
     
@@ -497,10 +501,12 @@ def parse_args(argv=None):
                         help="Optional class weights for CE, one float per class (add nr with spacing, no list)")
     parser.add_argument('--bspline_slices', action='store_true',
                      help="Reconstruct validation using the B-spline grid. Automatic for datasets containing 'bspline'.")
-    parser.add_argument('--calculate-val-3d-hd', '--calculate_val_3d_hd', action='store_true',
-                        help='Also evaluate 3D HD each epoch. Default computes only 3D Dice.')
+    parser.add_argument('--calculate-val-3d-hd-nsd', '--calculate_val_3d_hd_nsd', action='store_true',
+                        help='Also evaluate 3D HD and NSD each epoch. Default computes only 3D Dice.')
     parser.add_argument('--hd-percentile', '--hd_percentile', type=float, default=95,
                         choices=[50, 90, 95, 100])
+    parser.add_argument('--nsd-tolerance', '--nsd_tolerance', type=float, default=3.0,
+                        help='3D normalized surface Dice tolerance in mm (default: 3.0).')
     parser.add_argument('--include-penalty', action='store_true',
                         help='Use the scan diagonal for one-empty 3D HD pairs.')
     parser.add_argument('--source-scan-pattern', default='data/segthor_full/train/{id_}/{id_}.nii.gz')
@@ -554,8 +560,10 @@ def parse_args(argv=None):
 
     if args.debug and args.dataset != 'TOY2':
         parser.error('3D validation needs complete patients. --debug truncates the slices.')
-    if args.calculate_val_3d_hd and args.dataset == 'TOY2':
-        parser.error('--calculate-val-3d-hd requires a SEGTHOR dataset.')
+    if args.calculate_val_3d_hd_nsd and args.dataset == 'TOY2':
+        parser.error('--calculate-val-3d-hd-nsd requires a SEGTHOR dataset.')
+    if args.calculate_val_3d_hd_nsd and (not math.isfinite(args.nsd_tolerance) or args.nsd_tolerance < 0):
+        parser.error('--nsd-tolerance must be finite and nonnegative (mm).')
     valid_spacing = [math.isfinite(s) and s > 0 for s in args.new_spacing]
     if not all(valid_spacing):
         parser.error('--new-spacing values must be finite and positive.')
