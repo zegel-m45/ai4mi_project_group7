@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from dual_cross_attention.dca import DCA
 
 
 def random_weights_init(m):
@@ -172,19 +173,39 @@ class BottleNeckUpSampling(nn.Module):
                 return output
 
 
+# NEW: FastSurfer-inspired context fusion before spatial pooling
+# Reference: https://github.com/Deep-MI/FastSurfer, FastSurferCNN/models/sub_module.py, CompetitiveDenseBlockInput
+# Uses 3x3 convolutions and ENet's K channels, not the full FastSurfer model.
+class ContextInputBlock(nn.Module):
+        def __init__(self, in_dim: int, channels: int):
+                super().__init__()
+                self.input_batchnorm = nn.BatchNorm2d(in_dim)
+                self.convs = nn.ModuleList([nn.Conv2d(in_dim if i == 0 else channels, channels, kernel_size=3, padding=1) for i in range(4)])
+                self.norms = nn.ModuleList([nn.BatchNorm2d(channels) for _ in range(4)])
+                self.activation = nn.PReLU()
+
+        def forward(self, input: Tensor) -> Tensor:
+                # First convolution mixes all context channels at full resolution
+                features = self.norms[0](self.convs[0](self.input_batchnorm(input)))
+
+                # Feature-wise competition between successive learned representations
+                for i in (1, 2):
+                        candidate = self.norms[i](self.convs[i](self.activation(features)))
+                        features = torch.maximum(features, candidate)
+                
+                return self.norms[3](self.convs[3](self.activation(features)))
+
+
 class ENet(nn.Module):
         def __init__(self, in_dim: int, out_dim: int, **kwargs):
                 super().__init__()
                 F: int = kwargs["factor"] if "factor" in kwargs else 4  # Projecting factor
                 K: int = kwargs["kernels"] if "kernels" in kwargs else 16  # n_kernels
 
-                # from models.enet import (BottleNeck,
-                #                          BottleNeckDownSampling,
-                #                          BottleNeckUpSampling,
-                #                          conv_block)
-
                 # Initial operations
-                self.conv0 = nn.Conv2d(in_dim, K - in_dim, kernel_size=3, stride=2, padding=1)
+                # NEW: Learn K context features before pooling
+                self.context_input = ContextInputBlock(in_dim, K) 
+                
                 self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
 
                 # Downsampling half
@@ -213,6 +234,24 @@ class ENet(nn.Module):
                                                  BottleNeck(K * 8, K * 8, F, dropoutRate=0.1, asym=True),
                                                  BottleNeck(K * 8, K * 4, F, dilation=16, dilate_last=True))
 
+                # NEW: Enhance the two encoder skip connections with DCA (Dual-Cross Attention) jointly before decoder concatenation
+                self.use_dca = kwargs.get("use_dca", True)
+                dca_patch = kwargs.get("dca_patch", 16)
+                dca_heads = kwargs.get("dca_spatial_heads", 4)
+                if self.use_dca:
+                        if not isinstance(dca_patch, int) or dca_patch < 1:
+                                raise ValueError("dca_patch must be a positive integer")
+                        if not isinstance(dca_heads, int) or dca_heads < 1 or K % dca_heads:
+                                raise ValueError("dca_spatial_heads must be positive and divide kernels")
+                        
+                        self.dca = DCA(features=[K, K * 4], # DCA sees K and 4K channels
+                                strides=[1, 1],  # Resized to the original skip sizes below
+                                patch=dca_patch,
+                                channel_head=[1, 1],
+                                spatial_head=[dca_heads, dca_heads],
+                                n=1,
+                                resize_to_input=True)
+
                 # Upsampling half
                 self.bottleneck4 = nn.Sequential(BottleNeckUpSampling(K * 8, K * 4, F),
                                                  BottleNeck(K * 4, K * 4, F, dropoutRate=0.1),
@@ -229,9 +268,8 @@ class ENet(nn.Module):
 
         def forward(self, input):
                 # Initial operations
-                conv_0 = self.conv0(input)
-                maxpool_0 = self.maxpool0(input)
-                outputInitial = torch.cat((conv_0, maxpool_0), dim=1)
+                # NEW: Pool learned context features instead of raw slices
+                outputInitial = self.maxpool0(self.context_input(input)) # output remains [B, K, H/2, W/2]
 
                 # Downsampling half
                 bn1_0, indices_1 = self.bottleneck1_0(outputInitial)
@@ -242,9 +280,16 @@ class ENet(nn.Module):
                 # Middle operations
                 bn3_out = self.bottleneck3(bn2_out)
 
+                # Only decoder skips are enhanced; encoder features and pooling indices stay paired.
+                skip_initial, skip_stage1 = outputInitial, bn1_out
+                
+                # NEW: Apply DCA (Dual-Cross Attention) to skip connections
+                if self.use_dca:
+                        skip_initial, skip_stage1 = self.dca([outputInitial, bn1_out])
+
                 # Upsampling half
-                bn4_out = self.bottleneck4((bn3_out, indices_2, bn1_out))
-                bn5_out = self.bottleneck5((bn4_out, indices_1, outputInitial))
+                bn4_out = self.bottleneck4((bn3_out, indices_2, skip_stage1))
+                bn5_out = self.bottleneck5((bn4_out, indices_1, skip_initial))
 
                 # Final upsampling and covolutions
                 interpolated = F.interpolate(bn5_out, mode='nearest', scale_factor=2)
