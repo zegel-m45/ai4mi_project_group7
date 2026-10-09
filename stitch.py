@@ -37,10 +37,43 @@ from skimage.transform import resize
 
 from utils import map_, tqdm_
 
+import cupy as cp
+from cucim.skimage.measure import label as cucim_label
 
 def get_z(image: Path) -> int:
     return int(image.stem.split('_')[-1])
 
+def keep_largest_component_3d(mask_3d: np.ndarray) -> np.ndarray:
+    """
+    GPU-accelerated 3D connected component using cuCIM.
+    """
+    # Move array to GPU (CuPy)
+    mask_gpu = cp.asarray(mask_3d)
+    cleaned_mask_gpu = cp.zeros_like(mask_gpu)
+
+    # Directly copy class 1 over so it stays completely unfiltered
+    cleaned_mask_gpu[mask_gpu == 1] = 1
+
+    classes = cp.unique(mask_gpu)
+    # Skip background class and esophagus (already handled)
+    classes = classes[~cp.isin(classes, cp.asarray((0,1)))]
+    
+    for cls in classes:
+        binary_mask = (mask_gpu == cls)
+        
+        # cucim GPU label (faster)
+        # Connectivity of 1, 2 or 3 (6, 18, 26)
+        labeled_mask, num_features = cucim_label(binary_mask, connectivity=2, return_num=True)
+        
+        if num_features == 0:
+            continue
+        # Faster than returning to CPU 
+        sizes = cp.array([(labeled_mask == i).sum() for i in range(1, int(num_features) + 1)])
+        largest_label = int(cp.argmax(sizes)) + 1
+        # # Clear all voxels of this class first, then write back only the largest component
+        cleaned_mask_gpu[labeled_mask == largest_label] = cls
+    # Move final result back to CPU NumPy array
+    return cp.asnumpy(cleaned_mask_gpu)
 
 def merge_patient(id_: str, dest_folder: str, images: list[Path],
                   idxes: list[int], K: int, source_pattern: str, bspline: bool = False,
@@ -79,6 +112,9 @@ def merge_patient(id_: str, dest_folder: str, images: list[Path],
         res_arr[:, :, z] = resized[...].T # transpose to match 3D slicer and online images orientation
 
     assert set(np.unique(res_arr)) <= set(range(K))
+
+    # Keep only the largest component
+    res_arr = keep_largest_component_3d(res_arr)
 
     if bspline:
         res_arr = np.flip(res_arr, axis=(0, 1))
