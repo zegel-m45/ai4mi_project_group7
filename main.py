@@ -70,6 +70,7 @@ datasets_params["SEGTHOR_gaussian"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8
 datasets_params["SEGTHOR_elastic"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_elastic_xy"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 datasets_params["SEGTHOR_elastic_Vnet"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
+datasets_params["SEGTHOR_elastic_Vnet_512"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 # Source - https://stackoverflow.com/a/64584503 
 # Posted by yeachan park, modified by community. See post 'Timeline' for change history 
@@ -467,7 +468,7 @@ def evaluate_validation_3d(args, epoch_folder, classes):
         dice_only=not args.calculate_val_3d_hd_nsd, percentile=args.hd_percentile,
         nsd_tolerance=args.nsd_tolerance,
         device='cuda' if args.gpu and torch.cuda.is_available() else 'cpu',
-        include_penalty=args.include_penalty))
+        include_penalty=args.include_penalty), include_background=args.include_background)
     
     return results
 
@@ -507,6 +508,8 @@ def parse_args(argv=None):
                         choices=[50, 90, 95, 100])
     parser.add_argument('--nsd-tolerance', '--nsd_tolerance', type=float, default=3.0,
                         help='3D normalized surface Dice tolerance in mm (default: 3.0).')
+    parser.add_argument('--include-background', action='store_true',
+                        help='Include class 0 in 3D evaluation; checkpoint selection remains organ-only.')
     parser.add_argument('--include-penalty', action='store_true',
                         help='Use the scan diagonal for one-empty 3D HD pairs.')
     parser.add_argument('--source-scan-pattern', default='data/segthor_full/train/{id_}/{id_}.nii.gz')

@@ -159,7 +159,7 @@ def evaluate_hd_in_2d(args):
     print(f'Total slices: {len(files)}; foreground slice-class pairs: {len(files) * (args.classes - 1)}')
 
 
-def evaluate_dice_hd_nsd_in_3d(args):
+def evaluate_dice_hd_nsd_in_3d(args, include_background=False):
     dice_only = getattr(args, 'dice_only', False)
     nsd_tolerance = getattr(args, 'nsd_tolerance', 3.0)
     if not dice_only and (not np.isfinite(nsd_tolerance) or nsd_tolerance < 0):
@@ -217,7 +217,7 @@ def evaluate_dice_hd_nsd_in_3d(args):
             # parallelepiped diagonal: sqrt(sum((scan shape * voxel spacing)**2)) -> Euclidean norm
             penalty = np.linalg.norm(np.asarray(pred.shape) * spacing) if args.include_penalty else np.nan
 
-        for k in range(1, args.classes):  # skip background
+        for k in range(0 if include_background else 1, args.classes):
             prediction = pred == k
             target = gt == k
             pred_present = prediction.any()
@@ -287,7 +287,7 @@ def evaluate_dice_hd_nsd_in_3d(args):
     np.save(args.output_dir / 'patients_val.npy', np.asarray(patient_names))
 
     # Collect defined scores for each organ, then average across patients
-    for k in range(1, args.classes): # skip background
+    for k in range(0 if include_background else 1, args.classes):
         valid_hd = []
         valid_dice = []
         valid_nsd = []
@@ -349,6 +349,8 @@ if __name__ == '__main__':
     parser.add_argument('--nsd-tolerance', type=float, default=3.0,
                         help='3D normalized surface Dice tolerance in mm (default: 3.0).')
     parser.add_argument('--dimensionality', type=int, choices=[2, 3], default=3)
+    parser.add_argument('--include-background', action='store_true',
+                        help='Include class 0 in 3D metric computation and summaries (default: excluded).')
     parser.add_argument('--dice-only', action='store_true',
                         help='For 3D only: skip HD and NSD computation and saving, while keeping Dice, FP/FN and patient IDs')
     parser.add_argument('--include-penalty', action='store_true',
@@ -364,4 +366,4 @@ if __name__ == '__main__':
         assert args.spacing_file is not None, '--spacing-file is required for 2D evaluation'
         evaluate_hd_in_2d(args)
     elif args.dimensionality == 3:
-        evaluate_dice_hd_nsd_in_3d(args)
+        evaluate_dice_hd_nsd_in_3d(args, include_background=args.include_background)
