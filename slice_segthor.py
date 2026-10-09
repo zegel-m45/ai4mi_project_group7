@@ -151,7 +151,7 @@ def slice_patient(id_: str, dest_path: Path, source_path: Path, shape: tuple[int
 
     id_path: Path = source_path / ("train" if not test_mode else "test") / id_
 
-    ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}.nii.gz")
+    ct_path: Path = (id_path / f"{id_}.nii.gz") if not test_mode else (source_path / "test" / f"{id_}")
     nib_obj = nib.load(str(ct_path))
     ct: np.ndarray = np.asarray(nib_obj.dataobj)
     # dx, dy, dz = nib_obj.header.get_zooms()
@@ -460,7 +460,7 @@ def main(args: argparse.Namespace):
                                  dest_path=dest_mode,
                                  source_path=src_path,
                                  shape=tuple(args.shape),
-                                 test_mode=mode == 'test',
+                                 test_mode=args.test_mode,
                                  clip=args.clip,
                                  norm=args.norm,
                                  norm_scope=args.norm_scope,
@@ -555,7 +555,9 @@ def get_args() -> argparse.Namespace:
     parser.add_argument('--elastic_sigma', type=float, default=2.0)
     parser.add_argument('--elastic_points', type=int, default=2)
     parser.add_argument('--elastic_p', type=float, default=0.2)
+    parser.add_argument('--test_mode', action="store_true", help="Also process the test set.")
     args = parser.parse_args()
+
     random.seed(args.seed)
 
     print(args)
