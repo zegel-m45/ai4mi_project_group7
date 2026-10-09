@@ -112,7 +112,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     kernels: int = args.kernels
     factor: int = args.factor
     in_dim = args.context_slices
-    net = datasets_params[args.dataset]['net'](in_dim, K, kernels=kernels, factor=factor)
+    net = datasets_params[args.dataset]['net'](in_dim, K, kernels=kernels, factor=factor, use_dca=args.dca)
     net.init_weights()
     net.to(device)
 
@@ -546,11 +546,15 @@ def parse_args(argv=None):
     parser.add_argument('--num-workers', '--num_workers', type=int, default=5,
                         help="Data-loader workers; 0 loads data in the main process.")
     parser.add_argument('--kernels', type=int, default=None,
-                        help="ENet base channel count, not spatial kernel size; "
+                        help="ENet base channel count, not spatial kernel size. "
                              "None uses the dataset default (8). SEGTHOR only.")
     parser.add_argument('--factor', type=int, default=None,
-                        help="ENet bottleneck channel-reduction factor; "
+                        help="ENet bottleneck channel-reduction factor. "
                              "None uses the dataset default (2). SEGTHOR only.")
+    parser.add_argument('--dca', action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable Dual-Cross Attention for encoder-decoder skip connections in ENet (default: enabled)."   
+                             "--no-dca disables it. "
+                             "Does not affect the TOY2 shallow network.")
     parser.add_argument('--logit-scale', '--logit_scale', type=float, default=1.0,
                         help="Positive multiplier applied to logits before softmax "
                              "during training and validation (inverse temperature).")
