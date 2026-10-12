@@ -265,12 +265,14 @@ Inference on the test set requires three types of input data:
 - Input images (.npy) (for model input)
 - NIfTI scans (for stitching the predictions)
 
-`python inference.py \
+```bash
+python inference.py \
     --checkpoint /path/to/bestweights.pt \
     --image-dir /path/to/test/img \
     --output-dir /path/to/output \
     --source-scan-pattern /path/to/scans/{id_}.nii.gz
-`
+```
+
 The output will contain (1) predicted 2D segmentation slices and (2) the reconstructed 3D segmentation volume, per patient.
 
 <a id="optional-arguments"></a>
