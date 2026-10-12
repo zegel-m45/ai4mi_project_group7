@@ -258,6 +258,32 @@ The main criterions for scoring will include (listed here only for convenience, 
 ### Saving the best model
 `torch.save(net, args.dest / "bestmodel-group-XX.pkl")`
 
+<a id="inference"></a>
+## Inference
+Inference on the test set requires three types of input data:
+- Model weights
+- Input images (.npy) (for model input)
+- NIfTI scans (for stitching the predictions)
+
+`python inference.py \
+    --checkpoint /path/to/bestweights.pt \
+    --image-dir /path/to/test/img \
+    --output-dir /path/to/output \
+    --source-scan-pattern /path/to/scans/{id_}.nii.gz
+`
+The output will contain (1) predicted 2D segmentation slices and (2) the reconstructed 3D segmentation volume, per patient.
+
+<a id="optional-arguments"></a>
+### Optional Arguments
+
+| Argument | Default | Description |
+|---|---|---|
+| `--num-workers` | `5` | Number of worker processes used for loading the dataset. |
+| `--bspline` | Disabled | Uses B-spline resampling during reconstruction. Use this if B-spline resampling was applied during preprocessing. |
+| `--new-spacing` | `1.0 1.0 1.0` | Spacing used during preprocessing of B-spline datasets. |
+
+**Note:** Some settings, including the model architecture and configuration (DCA, scaling factor, number of input slices, number of classes, and number of kernels etc.), are defined (as constants) directly in the code.
+
 <a id="archiving-everything-for-submission"></a>
 ### Archiving everything for submission
 All files should be grouped in single folder with the following structure
