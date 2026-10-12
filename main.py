@@ -477,30 +477,30 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('--epochs', default=20, type=int)
-    parser.add_argument('--dataset', default='TOY2', choices=datasets_params.keys())
+    parser.add_argument('--epochs', default=50, type=int)
+    parser.add_argument('--dataset', default='SEGTHOR_elastic_Vnet_512', choices=datasets_params.keys())
     parser.add_argument('--dest', type=Path, required=True,
                         help="Destination directory to save the results (predictions and weights).")
-    parser.add_argument('--gpu', action='store_true')
+    parser.add_argument('--gpu', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--debug', action='store_true',
                         help="Keep only a fraction (10 samples) of the datasets, "
                              "to test the logics around epochs and logging easily.")
     # Loss params
     parser.add_argument('--mode', default='full', choices=['partial', 'full'])
-    parser.add_argument('--loss', default='ce', choices=['ce', 'combined'],
+    parser.add_argument('--loss', default='combined', choices=['ce', 'combined'],
                         help="ce: plain cross-entropy. combined: CE + (Generalized) Dice.")
     parser.add_argument('--dice-alpha', '--dice_alpha', type=float, default=0.5,
                         help="Weight of CE vs Dice for combined loss")
     parser.add_argument('--generalized-dice', '--generalized_dice', action='store_true',
                         help="Use GeneralizedDiceLoss instead of DiceLoss")
-    parser.add_argument('--boundary-weight', '--boundary_weight', type=float, default=0.0,
+    parser.add_argument('--boundary-weight', '--boundary_weight', type=float, default=0.01,
                         help="Weight of the boundary loss added to the combined loss. 0 disables it.")
-    parser.add_argument('--boundary-steal', '--boundary_steal', type=float, default=0.0,
+    parser.add_argument('--boundary-steal', '--boundary_steal', type=float, default=0.01,
                         help="Per epoch, move this much weight from the CE/Dice loss to the boundary loss "
                              "(StealWeight of the boundary-loss repo, region weight floored at 0.1). 0 disables it.")
     parser.add_argument('--ce-weight', '--ce_weight', type=float, nargs='+', default=None,
                         help="Optional class weights for CE, one float per class (add nr with spacing, no list)")
-    parser.add_argument('--bspline_slices', action='store_true',
+    parser.add_argument('--bspline_slices', action=argparse.BooleanOptionalAction, default=True,
                      help="Reconstruct validation using the B-spline grid. Automatic for datasets containing 'bspline'.")
     parser.add_argument('--calculate-val-3d-hd-nsd', '--calculate_val_3d_hd_nsd', action='store_true',
                         help='Also evaluate 3D HD and NSD each epoch. Default computes only 3D Dice.')
@@ -517,7 +517,7 @@ def parse_args(argv=None):
     parser.add_argument('--gt-3d-pattern', default='{patient}/GT.nii.gz')
     parser.add_argument('--new-spacing', type=float, nargs=3, default=[1., 1., 1.],
                         help='Spacing used when preprocessing B-spline datasets.')
-    parser.add_argument('--seed', type=int, default=0, help="Random seed for reproducibility.")
+    parser.add_argument('--seed', type=int, default=2, help="Random seed for reproducibility.")
     parser.add_argument('--patience', type=int, default=10, help="Patience for early stopping.")
     parser.add_argument('--optimizer', type=str, default='adam', choices=['adam', 'adamw', 'sgd'],
                         help="Optimizer to use for training.")
@@ -543,14 +543,14 @@ def parse_args(argv=None):
                         help="Minimum absolute Dice gain for the scheduler; checkpoint selection is unchanged.")
     parser.add_argument('--min-lr', type=float, default=1e-6,
                         help="Minimum learning rate for the plateau scheduler.")
-    parser.add_argument('--batch-size', '--batch_size', type=int, default=None,
+    parser.add_argument('--batch-size', '--batch_size', type=int, default=8,
                         help="Batch size for training and validation; None uses the dataset default "
                              "(TOY2: 2, SEGTHOR variants: 8).")
     parser.add_argument('--num-workers', '--num_workers', type=int, default=5,
                         help="Data-loader workers; 0 loads data in the main process.")
     parser.add_argument('--kernels', type=int, default=None,
                         help="ENet base channel count, not spatial kernel size. "
-                             "None uses the dataset default (8). SEGTHOR only.")
+                             "None uses 16 for SEGTHOR_elastic_Vnet_512, otherwise the dataset default (8). SEGTHOR only.")
     parser.add_argument('--factor', type=int, default=None,
                         help="ENet bottleneck channel-reduction factor. "
                              "None uses the dataset default (2). SEGTHOR only.")
@@ -561,8 +561,8 @@ def parse_args(argv=None):
     parser.add_argument('--logit-scale', '--logit_scale', type=float, default=1.0,
                         help="Positive multiplier applied to logits before softmax "
                              "during training and validation (inverse temperature).")
-    parser.add_argument('--context-slices', type=int, default=1,
- 	                        help="Number of total context slices for 2.5D, default=1 is 2D")
+    parser.add_argument('--context-slices', type=int, default=13,
+ 	                        help="Number of total context slices for 2.5D; 1 enables 2D.")
     args = parser.parse_args(argv)
 
     if args.debug and args.dataset != 'TOY2':
@@ -582,7 +582,7 @@ def parse_args(argv=None):
     if args.batch_size is None:
         args.batch_size = params['B']
     if args.kernels is None:
-        args.kernels = params.get('kernels', 8)
+        args.kernels = 16 if args.dataset == 'SEGTHOR_elastic_Vnet_512' else params.get('kernels', 8)
     if args.factor is None:
         args.factor = params.get('factor', 2)
 
