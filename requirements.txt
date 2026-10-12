@@ -8,3 +8,9 @@ scikit-image
 matplotlib
 monai
 scipy
+einops
+elasticdeform
+ipython
+ipykernel
+cupy-cuda13x
+cucim-cu13
