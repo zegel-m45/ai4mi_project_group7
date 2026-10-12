@@ -13,6 +13,7 @@
         - [2D viewer](#2d-viewer)
         - [3D viewers](#3d-viewers)
     - [Plotting the metrics](#plotting-the-metrics)
+- [Inference and offline metrics](#inference-and-offline-metrics)
 - [Submission and scoring](#submission-and-scoring)
     - [Packing the code](#packing-the-code)
     - [Saving the best model](#saving-the-best-model)
@@ -227,6 +228,24 @@ options:
 $ python plot.py --metric_file results/segthor/ce/dice_val.npy --dest results/segthor/ce/dice_val.png
 ```
 ![Validation DSC](dice_val.png)
+
+### Offline 3D metric computation
+To evaluate stitched validation predictions against ground truth on the same physical grid, use the command below. It computes per-patient, per-class Dice, HD95 (mm), and NSD with a 3 mm tolerance:
+
+```bash
+python evaluate_metrics_offline.py \
+    --dimensionality 3 \
+    --pred-dir results/final_model/ce_seed2/best_epoch/val_volumes \
+    --gt-dir data/segthor_full/train \
+    --gt-pattern '{patient}/GT.nii.gz' \
+    --output-dir offline_results/final_model/ce_seed2/metrics_3d \
+    --percentile 95 --nsd-tolerance 3 \
+    --device cpu --include-penalty
+```
+
+Use `--device auto` to select CUDA when available, `percentile` to change the HD percentile, `--nsd-tolerance` to change the tolerance in mm, or `--dice-only` to skip HD and NSD. Background (class 0) is excluded by default. Add `--include-background` to evaluate the background (class 0). With `--include-penalty`, one-empty pairs receive the scan diagonal for HD, while Dice and NSD are 0. Both-empty pairs receive Dice/NSD = 1 and HD = 0.
+
+The output directory contains `dice_3d_val.npy`, `hd_3d_val.npy`, `nsd_3d_val.npy`, patient IDs, presence-error flags, and the NSD tolerance. 
 
 
 <a id="submission-and-scoring"></a>
